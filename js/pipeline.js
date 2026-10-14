@@ -499,6 +499,9 @@
     bleedR: 2,              // 出界的像素半径
     organic: true,          // 单笔形态人性化：弧线 + 手抖 + 宽窄起伏
     inkEarly: false,        // 调试开关：勾线层放到铺色之前（默认 "铺色 → 勾线收形"，见 README 的坑 4）
+    holeFill: true,         // 收尾补漏：把"还是没画上"的小洞逐个补掉（残差补笔有"太小/太散不补"的门槛）
+    holeT: 28,              // 补漏的判定阈值（单通道差）
+    holeMax: 420,           // 只补这么大的洞（像素数）；更大的块属于平涂风格化，补了会花
   };
 
   function regionMaskOf(compOf, W, compId, x0, y0, x1, y1) {
@@ -1020,10 +1023,11 @@
         for (let i = 0; i < dt.length; i++) if (dt[i] > dmax) dmax = dt[i];
         const half = clamp(dmax + 1.4 * strokeScale, 2.0, 12 * strokeScale);
         // 分支队列：每画一条最长骨架路径，就把剩下没盖住的连通块继续排队，
-        // 直到整层线稿都被笔画覆盖（复杂线稿会有很多分支）
+        // 直到整层线稿都被笔画覆盖（复杂线稿会有很多分支）。
+        // 剩下的块只要还有点面积就继续排——门槛太高会留下没人画的白点。
         const queue = [bin.slice()];
         let guard = 0;
-        while (queue.length && guard++ < 60) {
+        while (queue.length && guard++ < 200) {
           const m0 = queue.shift();
           const { sk } = thin(m0, bw.w, bw.h);
           const lp = longestPath(sk, bw.w, bw.h);
@@ -1051,7 +1055,7 @@
           // 剩下的连通块继续排队
           const rc = compsOfLabels(m0, bw.w, bw.h);
           for (let j = 0; j < rc.comps.length; j++) {
-            if (rc.comps[j].label !== 1 || rc.comps[j].count < Math.max(24, 3 * half * half)) continue;
+            if (rc.comps[j].label !== 1 || rc.comps[j].count < Math.max(6, half * half)) continue;
             const nm = new Uint8Array(bw.w * bw.h);
             for (let k = 0; k < rc.comps[j].count; k++) nm[rc.pix[rc.comps[j].start + k]] = 1;
             queue.push(nm);
@@ -1175,7 +1179,7 @@
         const pts = new Float64Array(np2 * 2);
         for (let i = 0; i < np2; i++) { pts[i * 2] = ribArr[i * 2] - xmin; pts[i * 2 + 1] = ribArr[i * 2 + 1] - ymin; }
         fillPoly(local, mw, mh, pts);
-        const soft = feather(local, mw, mh);
+        const soft = opts.hardRaster ? local : feather(local, mw, mh);   // 网页端是硬边裁剪，可用 hardRaster 对齐口径
         for (let y = 0; y < mh; y++) {
           const yy = ymin + y;
           const rowC = (yy - cl.y) * cl.w;
@@ -1414,6 +1418,105 @@
         prevPct = pct;
         await yieldUI();
       }
+
+      // ---- 收尾补漏：残差补笔为了不把平滑渐变补成拼贴，设了"太小不补、太散不补"的门槛，
+      //      贴着大片差异的小洞也会被连带跳过。这里分两类补，保证画面不留白点、白线：
+      //      A) 真空白——画布上这块还是白的（什么都没画到），而原图不是白的；不论大小都补
+      //      B) 剩余的"小块/细条"错误——用厚度判定，大而厚的块仍跳过（那是平涂风格化本身）
+      if (opts.holeFill) {
+        const thrH = clamp(opts.holeT * strokeScale, 16, 72);
+        const whiteish = (i) => canvas[i * 3] >= 245 && canvas[i * 3 + 1] >= 245 && canvas[i * 3 + 2] >= 245;
+        const errAt = (i) => Math.max(Math.abs(canvas[i * 3] - R[i]),
+                                      Math.abs(canvas[i * 3 + 1] - G[i]),
+                                      Math.abs(canvas[i * 3 + 2] - B[i]));
+        // 补一个连通块：贴着它的形状走一条（或几条）笔
+        const fillComp = (comp, comps2) => {
+          const x0 = comp.x0, y0 = comp.y0, x1 = comp.x1, y1 = comp.y1;
+          const mw = x1 - x0 + 1, mh = y1 - y0 + 1;
+          const bin = new Uint8Array(mw * mh);
+          let cr = 0, cg = 0, cb = 0;
+          for (let k = 0; k < comp.count; k++) {
+            const p = comps2.pix[comp.start + k];
+            const x = p % W, y = (p - x) / W;
+            bin[(y - y0) * mw + (x - x0)] = 1;
+            cr += R[p]; cg += G[p]; cb += B[p];
+          }
+          const col = [Math.round(cr / comp.count), Math.round(cg / comp.count), Math.round(cb / comp.count)];
+          // 严格只覆盖"确实画错/没画"的那些像素，不外扩——否则会把周围本来正确的像素也刷成均值色
+          const cIdx = pushClip(x0, y0, mw, mh, bin);
+          const dt = distanceTransform(bin, mw, mh);
+          const dvals = Array.from(dt).sort((a, b) => a - b);
+          const dmed = dvals[dvals.length >> 1];
+          const half = clamp(dmed + 1.2 * strokeScale, 1.6 * strokeScale, 9 * strokeScale);
+          const sk3 = thin(bin, mw, mh).sk;
+          const lp = longestPath(sk3, mw, mh);
+          if (lp && lp.len >= 2) {
+            const absPath = new Float64Array(lp.len * 2);
+            for (let i = 0; i < lp.len; i++) {
+              absPath[i * 2] = lp.pts[i * 2] + x0;
+              absPath[i * 2 + 1] = lp.pts[i * 2 + 1] + y0;
+            }
+            const segs = pathSegments(absPath, lp.len, Math.max(24, half * 4));
+            for (const sg of segs) {
+              if (sg.n < 2) continue;
+              emitRaster(ribbon(sg.pts, sg.n, half), sg.pts, sg.n, half, col, col[0] < 120 ? 1 : 0, cIdx, 3);
+            }
+          } else {
+            const cx0 = (x0 + x1) / 2, cy0 = (y0 + y1) / 2;
+            const rad = clamp(Math.hypot(mw, mh) / 2 + 1.2 * strokeScale, 2.2, 10);
+            const poly = [];
+            for (let k = 0; k < 13; k++) {
+              const a = k / 13 * Math.PI * 2;
+              poly.push(cx0 + rad * Math.cos(a), cy0 + rad * Math.sin(a));
+            }
+            emitRaster(poly, [cx0, cy0], 1, rad, col, 0, cIdx, 3);
+          }
+        };
+        const fillMask = (mask, limit) => {
+          const cc2 = compsOfLabels(mask, W, H);
+          const list = [];
+          for (let ci = 0; ci < cc2.comps.length; ci++) if (cc2.comps[ci].label === 1) list.push(ci);
+          list.sort((a, b) => cc2.comps[b].count - cc2.comps[a].count);
+          let n = 0;
+          for (const ci of list.slice(0, limit)) { fillComp(cc2.comps[ci], cc2); n++; }
+          return n;
+        };
+        // A) 真空白
+        let nA = 0;
+        {
+          const m = new Uint8Array(N);
+          let any = 0;
+          for (let i = 0; i < N; i++) if (whiteish(i) && errAt(i) > thrH) { m[i] = 1; any++; }
+          if (any) nA = fillMask(m, 3000);
+        }
+        // B) 剩余的小块/细条错误（A 补完后重新算，已经补上的不再重复）。
+        //    这里的阈值放宽一倍：照片这类纹理区里，一小块错误用的是一个均值色，
+        //    补上去对块内偏暗的一半反而更差，所以只补"明显不对"的那部分。
+        let nB = 0;
+        {
+          const thrB = clamp(opts.holeT * 2 * strokeScale, 32, 120);
+          const m = new Uint8Array(N);
+          for (let i = 0; i < N; i++) if (errAt(i) > thrB) m[i] = 1;
+          const cc2 = compsOfLabels(m, W, H);
+          for (let ci = 0; ci < cc2.comps.length; ci++) {
+            const c = cc2.comps[ci];
+            if (c.label !== 1) continue;
+            const bw2 = c.x1 - c.x0 + 1, bh2 = c.y1 - c.y0 + 1;
+            const thick = c.count / Math.max(1, Math.max(bw2, bh2));
+            if (c.count > opts.holeMax && thick > 4) {          // 又大又厚：平涂风格化，不补
+              for (let k = 0; k < c.count; k++) m[cc2.pix[c.start + k]] = 0;
+            }
+          }
+          nB = fillMask(m, 2500);
+        }
+        if (nA || nB) {
+          let bad2 = 0;
+          for (let i = 0; i < N; i++) if (errAt(i) > 8) bad2++;
+          prog(0.995, `收尾补漏… 空白 ${nA} 处、碎块 ${nB} 处（可见差异 ${(bad2 / N * 100).toFixed(2)}%）`);
+          await yieldUI();
+        }
+      }
+
       keysOut.push({ i: strokes.length, rgb: canvas.slice() });
       visCanvas = canvas;
       keysRgb = keysOut;
