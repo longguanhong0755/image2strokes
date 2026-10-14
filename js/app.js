@@ -13,10 +13,16 @@ let idx = 0, acc = 0, playing = false, done = false, lastT = performance.now();
 let speed = 2, cursor = null, guide = null, showTip = true, showGuide = true;
 let clipCache = new Map(), lastClip = -1;
 let worker = null;
-let cumMs = null;              // 每笔的累计时长
+let cumMs = null;              // 每笔结束时的累计时间（含抬笔移动与停顿）
 let keys = [];                 // 关键帧快照 {i, data} 或 {i, rgb}（管线侧光栅）
 let keyEvery = 0;
 let KEYFRAMES = [];
+// "像人在画"需要的三段时间轴：抬笔移动 travel + 换阶段停顿 beat + 落笔绘制 paint
+let travels = null, beats = null, msPaint = null;
+let targetMs = 240000;
+let airPath = null;             // 抬笔移动的弧线（画在纸面上的淡虚线）
+const lastEnd = [0, 0];         // 上一笔收笔的位置（抬笔弧线的起点）
+const PHASES = ['起稿', '铺色', '收形', '点睛'];
 
 // ---------------- 工具 ----------------
 const clamp = (v, a, b) => (v < a ? a : (v > b ? b : v));
@@ -81,6 +87,7 @@ function startExtract(imgCanvas) {
     colors: parseInt($('colors').value, 10),
     targetSec: 240,
   };
+  targetMs = opts.targetSec * 1000;
   if (!worker) {
     worker = new Worker('js/worker.js');
     worker.onmessage = onWorker;
@@ -105,7 +112,7 @@ function onWorker(e) {
   $('stage').style.display = 'none';
   $('canvasWrap').style.display = 'block';
   $('stat').innerHTML = '共 <em>' + STATS.strokes + '</em> 笔 · 约 <em>' +
-    Math.round(STATS.totalMs / 1000) + '</em> 秒画完（1×）';
+    Math.round(STATS.totalMs / 1000) + '</em> 秒画完（1×）· 起稿 → 铺色 → 收形 → 点睛';
   playing = true;
   $('play').textContent = '暂停';
 }
@@ -123,11 +130,51 @@ function buildCanvases() {
   tmpC.width = W; tmpC.height = H;
   tmp = tmpC.getContext('2d');
   clipCache = new Map(); lastClip = -1;
-  cumMs = new Float64Array(STROKES.length + 1);
-  for (let i = 0; i < STROKES.length; i++) cumMs[i + 1] = cumMs[i] + STROKES[i].ms;
+  buildTimeline();
   keyEvery = Math.max(300, Math.ceil(STROKES.length / 8));
   keys = [];
   fitView();
+}
+
+// 时间轴：每笔 = 抬笔移动(短) + 换阶段停顿(偶尔) + 落笔绘制；总时长仍然锁在 4 分钟
+function buildTimeline() {
+  const n = STROKES.length;
+  travels = new Float64Array(n);
+  beats = new Float64Array(n);
+  msPaint = new Float64Array(n);
+  const ends = new Float64Array(n * 2);
+  let ex = 0, ey = 0, raw = 0, prevPh = -1;
+  for (let i = 0; i < n; i++) {
+    const st = STROKES[i];
+    const tp = st.tp;
+    if (i > 0) {
+      const d = Math.hypot(tp[0] - ex, tp[1] - ey);
+      // 手就在旁边就顺势接着画（不占时间）；隔得远才抬笔"飞"过去
+      travels[i] = d < 40 ? 0 : Math.min(200, 30 + (d - 40) * 0.35);
+    }
+    const ph = st.ph === undefined ? 1 : st.ph;
+    if (prevPh >= 0 && ph !== prevPh) beats[i] = ph === 3 ? 700 : 420;   // 换阶段前停一下，像在回看
+    prevPh = ph;
+    ex = tp[tp.length - 2]; ey = tp[tp.length - 1];
+    ends[i * 2] = ex; ends[i * 2 + 1] = ey;
+    raw += st.ms;
+  }
+  // 抬笔移动的总量封顶：细碎补笔动辄几千次"飞过去"，不封顶会把 4 分钟撑到七八分钟
+  const cap = targetMs * 0.2;
+  let sumT = 0;
+  for (let i = 0; i < n; i++) sumT += travels[i];
+  if (sumT > cap) { const sc = cap / sumT; for (let i = 0; i < n; i++) travels[i] *= sc; }
+  let nonPaint = 0;
+  for (let i = 0; i < n; i++) nonPaint += travels[i] + beats[i];
+  const budget = Math.max(n * 3, targetMs - nonPaint);
+  const k = raw > 0 ? budget / raw : 1;
+  cumMs = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) {
+    msPaint[i] = Math.max(3, STROKES[i].ms * k);
+    cumMs[i + 1] = cumMs[i] + travels[i] + beats[i] + msPaint[i];
+  }
+  if (STATS && n) STATS.totalMs = cumMs[n];
+  if (n) { lastEnd[0] = STROKES[0].tp[0]; lastEnd[1] = STROKES[0].tp[1]; }
 }
 
 function fitView() {
@@ -202,10 +249,35 @@ function paintStroke(i, u) {
   tmp.globalCompositeOperation = 'source-over';
   const ctx = painted.getContext('2d');
   ctx.drawImage(tmpC, rect.x, rect.y, rect.w, rect.h, rect.x, rect.y, rect.w, rect.h);
-  if (u >= 1) { pending = -1; pendRect = null; return true; }
+  if (u >= 1) {
+    pending = -1; pendRect = null;
+    lastEnd[0] = t.x; lastEnd[1] = t.y;      // 记下收笔位置，下一笔的抬笔弧线从这里起
+    return true;
+  }
   pending = i; pendRect = rect;
   return false;
 }
+
+// 抬笔移动：笔尖离开纸面，沿一条浅弧线飞到下一笔的起笔处（不落色，只留下淡淡的虚线）
+function travelTo(i, f) {
+  const st = STROKES[i];
+  const tp = st.tp;
+  const ox = lastEnd[0], oy = lastEnd[1];
+  const dx = tp[0] - ox, dy = tp[1] - oy;
+  const d = Math.hypot(dx, dy) || 1;
+  const bow = Math.min(46, d * 0.22);
+  const mx = (ox + tp[0]) / 2 - dy / d * bow;
+  const my = (oy + tp[1]) / 2 + dx / d * bow;
+  const e = f * f * (3 - 2 * f);                     // 起步慢、中间快、落下轻
+  cursor = {
+    x: (1 - e) * (1 - e) * ox + 2 * (1 - e) * e * mx + e * e * tp[0],
+    y: (1 - e) * (1 - e) * oy + 2 * (1 - e) * e * my + e * e * tp[1],
+    r: Math.max(2, st.w * 0.5), pen: st.pen, color: st.color, air: true,
+  };
+  airPath = [ox, oy, mx, my, tp[0], tp[1]];
+  guide = null;
+}
+function endTravel() { airPath = null; }
 
 // 笔尖前沿：以笔尖为中心、往后拉一块"已扫过"的多边形
 function leadPath(t, st) {
@@ -248,11 +320,33 @@ function flushMain() {
   }
   if (cursor && showTip && !done) drawCursor(mt, cursor);
   if (guide && showGuide && !done) drawGuide(mt, guide, cursor);
+  if (airPath && showGuide && !done) drawAir(mt, airPath);   // 抬笔移动的浅弧线
+}
+
+function drawAir(ctx, p) {
+  ctx.save();
+  ctx.setLineDash([5, 7]);
+  ctx.strokeStyle = 'rgba(70,70,82,0.22)';
+  ctx.lineWidth = Math.max(1, W / 1024) * 1.2;
+  ctx.beginPath();
+  ctx.moveTo(p[0], p[1]);
+  ctx.quadraticCurveTo(p[2], p[3], p[4], p[5]);
+  ctx.stroke();
+  ctx.restore();
 }
 
 function drawCursor(ctx, c) {
   ctx.save();
   ctx.translate(c.x, c.y);
+  if (c.air) {                                  // 抬笔：空心小圈 + 一点芯，看得出笔离开了纸面
+    ctx.strokeStyle = 'rgba(45,45,54,0.55)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.arc(0, 0, Math.max(2.8, c.r * 0.85), 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = 'rgba(45,45,54,0.45)';
+    ctx.beginPath(); ctx.arc(0, 0, Math.max(1.1, c.r * 0.26), 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    return;
+  }
   if (c.pen) {
     ctx.fillStyle = 'rgba(30,30,36,0.92)';
     ctx.beginPath();
@@ -289,12 +383,19 @@ function tick() {
   if (playing && !done) {
     acc += dt * speed;
     let guard = 0;
-    while (idx < STROKES.length && acc >= STROKES[idx].ms && guard++ < 400) {
-      acc -= STROKES[idx].ms;
+    while (idx < STROKES.length && guard++ < 400) {
+      const tot = travels[idx] + beats[idx] + msPaint[idx];
+      if (acc < tot) break;
+      acc -= tot;
       paintStroke(idx, 1);
       idx++;
       if (keyEvery && idx % keyEvery === 0 && idx < STROKES.length) snapshotKey(idx);
       if (idx >= STROKES.length) { finish(); break; }
+    }
+    if (idx < STROKES.length && !done) {
+      const tv = travels[idx] + beats[idx];
+      if (acc < tv) travelTo(idx, acc / Math.max(1, tv));        // 还在抬笔移动
+      else { endTravel(); paintStroke(idx, clamp((acc - tv) / msPaint[idx], 0, 1)); }
     }
   }
   flushMain();
@@ -337,16 +438,26 @@ function snapshotKey(i) {
 
 function hud() {
   if (!STATS) return;
-  const p = done ? 1 : (idx + (STROKES[idx] ? clamp(acc / STROKES[idx].ms, 0, 1) : 0)) / STROKES.length;
+  const n = STROKES.length;
+  const st = n ? STROKES[Math.min(idx, n - 1)] : null;
+  const cur = done ? STATS.totalMs : (cumMs[idx] + acc);
+  const p = STATS.totalMs > 0 ? cur / STATS.totalMs : 0;
   $('fill').style.width = (p * 100).toFixed(2) + '%';
-  const t = done ? STATS.totalMs : (function () {
-    let s = 0;
-    for (let i = 0; i < idx; i++) s += STROKES[i].ms;
-    return s + acc;
-  })();
-  $('clock').textContent = fmt(t / 1000) + ' / ' + fmt(STATS.totalMs / 1000);
-  if (!done) $('stat').innerHTML = '第 <em>' + Math.min(idx + 1, STROKES.length) + '</em> / ' +
-    STROKES.length + ' 笔 · ' + (p * 100).toFixed(0) + '%';
+  $('clock').textContent = fmt(cur / 1000) + ' / ' + fmt(STATS.totalMs / 1000);
+  const ph = done ? 4 : (st && st.ph !== undefined ? st.ph : 1);
+  setPhase(ph);
+  if (!done) {
+    $('stat').innerHTML = '阶段 <em>' + (PHASES[ph] || '') + '</em> · 第 <em>' +
+      Math.min(idx + 1, n) + '</em> / ' + n + ' 笔 · ' + (p * 100).toFixed(0) + '%';
+  }
+}
+
+function setPhase(ph) {
+  const el = $('phases');
+  if (!el) return;
+  for (let i = 0; i < el.children.length; i++) {
+    el.children[i].className = i === ph ? 'on' : (i < ph ? 'done' : '');
+  }
 }
 
 function fmt(s) {
@@ -355,12 +466,13 @@ function fmt(s) {
 }
 
 function resetPlayback() {
-  idx = 0; acc = 0; done = false; cursor = null; guide = null;
+  idx = 0; acc = 0; done = false; cursor = null; guide = null; airPath = null;
   pending = -1; pendRect = null;
   const ctx = painted.getContext('2d');
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, W, H);
   keys = [];
+  if (STROKES.length) { lastEnd[0] = STROKES[0].tp[0]; lastEnd[1] = STROKES[0].tp[1]; }
   playing = true;
   $('play').textContent = '暂停';
   $('stat').textContent = '准备开始…';
@@ -385,6 +497,12 @@ function jumpTo(sec) {
   done = false;
   idx = k ? k.i : 0;
   acc = 0;
+  airPath = null;
+  if (STROKES.length) {
+    const pi = Math.max(0, Math.min(idx - 1, STROKES.length - 1));
+    const tp = STROKES[pi].tp;
+    lastEnd[0] = tp[tp.length - 2]; lastEnd[1] = tp[tp.length - 1];
+  }
   advanceTo(tgt);
 }
 
@@ -396,7 +514,13 @@ function advanceTo(tgt) {
   }
   if (idx >= STROKES.length) { finish(); return; }
   acc = Math.max(0, tgt - cumMs[idx]);
-  paintStroke(idx, clamp(acc / STROKES[idx].ms, 0, 1));
+  const tv = travels[idx] + beats[idx];
+  if (acc < tv) {
+    travelTo(idx, acc / Math.max(1, tv));
+  } else {
+    endTravel();
+    paintStroke(idx, clamp((acc - tv) / msPaint[idx], 0, 1));
+  }
 }
 
 // ---------------- 收尾与差异 ----------------
@@ -435,8 +559,9 @@ function diffVsTarget() {
 }
 
 function finish() {
-  done = true; playing = false; cursor = null; guide = null;
+  done = true; playing = false; cursor = null; guide = null; airPath = null;
   $('play').textContent = '重播';
+  setPhase(4);
   const d = diffVsTarget();
   $('stat').innerHTML = '画完了 · <em>' + STROKES.length + '</em> 笔 · 整体差异（1/4 缩放）平均 <em>' +
     d.mean4.toFixed(2) + '/255</em>、可见差异 <em>' + d.bad4.toFixed(2) + '%</em>' +

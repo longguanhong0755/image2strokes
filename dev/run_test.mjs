@@ -6,7 +6,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
-await import(pathToFileURL(path.join(root, 'js/pipeline.js')).href);
+const pipeFile = process.env.PIPE || path.join(root, 'js/pipeline.js');
+await import(pathToFileURL(path.resolve(pipeFile)).href);
 
 const args = process.argv.slice(2);
 const rawPath = args[0] || path.join(here, 'cat.raw');

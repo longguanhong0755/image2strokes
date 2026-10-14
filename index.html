@@ -46,6 +46,11 @@
   label.chk{display:flex;align-items:center;gap:6px;color:var(--sub);font-size:13px;cursor:pointer}
   #stat{margin-top:10px;color:var(--ink);font-size:13.5px}
   #stat em{font-style:normal;color:var(--accent);font-weight:600}
+  .phases{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+  .phases span{font-size:12.5px;color:#9b9a95;border:1px solid var(--line);border-radius:99px;
+    padding:3px 11px;background:#fff;transition:.2s}
+  .phases span.on{color:#fff;background:var(--accent);border-color:var(--accent)}
+  .phases span.done{color:var(--accent);background:#fdf6f3;border-color:#eccbbd}
   .foot{color:var(--sub);font-size:12.5px;padding:0 24px 30px;max-width:980px}
   .foot code{background:#efece7;border-radius:5px;padding:1px 5px}
   @media (max-width:860px){ .wrap{grid-template-columns:1fr} }
@@ -116,12 +121,16 @@
           <input id="seek" class="seek" type="range" min="0" max="1000" value="0">
         </div>
         <div class="barwrap" style="margin-top:8px"><div id="fill"></div></div>
+        <div class="phases" id="phases">
+          <span>① 起稿</span><span>② 铺色</span><span>③ 收形</span><span>④ 点睛</span>
+        </div>
         <div id="stat"></div>
       </div>
       <div id="welcome">
         <p style="color:var(--sub);margin:6px 0 0">
           左边选一张图（或拖入自己的图），几秒后这里就会出现它被一笔一笔画出来的完整过程：
-          细线用硬笔尖勾，色块用软笔刷一档一档涂满，后面画的颜色会自然覆盖前面的，
+          先起稿勾轮廓，再大色块铺色、就近一档一档涂满，然后勾线收形、最后细笔点睛；
+          每一笔都是纯色，后面的颜色会自然覆盖前面的，笔尖换地方时会抬笔走过去。
           画完给出与原图的差异读数。
         </p>
       </div>
@@ -130,10 +139,16 @@
 </div>
 
 <div class="foot">
-  <b>它是怎么画的：</b>先把图片归成若干颜色区块（Lab 空间 k-means）→ 深色细线走骨架提取成"钢笔勾线"→
-  每个区块沿主轴来回铺色笔（每一笔一个纯色，按段取局部色）→ 最后按"与目标的差异"逐块补笔修形。
-  成品是纯色平涂画：插画/海报类目视几乎与原图一致（可见差异约 2~4%，差异集中在色块交界的 1px 过渡带），
-  照片/扫描件这类带纹理的图会被"风格化"成平涂画，逐像素差异会明显更大。
+  <b>它是怎么画的（像人一样分四步）：</b>
+  ① <b>起稿</b> — 先用细线把主要轮廓快速勾一遍，轻、快，后面会被颜色盖掉；
+  ② <b>铺色</b> — 白底先铺，再"大色块优先、同层次就近串起来"，一个区块内一笔一笔来回涂；
+  每一笔都是纯色，笔形带手抖、弧线和宽窄变化，偶尔还会压出轮廓外面（后面再被别的颜色覆盖回来）；
+  ③ <b>收形</b> — 勾线稿 + 按"哪里不像就补哪里"修边缘、压暗部；
+  ④ <b>点睛</b> — 最后几轮细笔抠细节。
+  换地方时笔尖会抬起来沿一条浅弧线走过去，所以看得出手在纸面上移动；画完给出与原图的差异读数。
+  <br><br>
+  <b>效果：</b>插画/海报类目视几乎与原图一致（可见差异约 2~4%，差异集中在色块交界的 1px 过渡带，
+  海报类因为纸面颗粒约 20%），照片/扫描件这类带纹理的图会被"风格化"成平涂画，逐像素差异会明显更大。
   <br><br>
   <b>说明：</b>示例图为公有领域 / CC0 素材，仅用于演示；上传自己的图片时全部处理都在本机浏览器里进行，不会上传到任何服务器。
 </div>

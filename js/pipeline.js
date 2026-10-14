@@ -14,6 +14,34 @@
 
   function luma(c) { return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]; }
 
+  // 确定性伪随机：同一张图每次生成的手抖/弧度/宽窄完全一致（便于复现与测试）
+  function rand01(a, b) {
+    const x = Math.sin(a * 12.9898 + b * 78.233) * 43758.5453;
+    return x - Math.floor(x);
+  }
+
+  // 就近串联（贪心最近邻）：让笔画顺序"手走到哪画到哪"，而不是满画布乱跳
+  function chainNN(items, posOf, sx, sy) {
+    const n = items.length;
+    const out = new Array(n);
+    const used = new Uint8Array(n);
+    let cx = sx, cy = sy;
+    for (let k = 0; k < n; k++) {
+      let best = -1, bd = Infinity;
+      for (let i = 0; i < n; i++) {
+        if (used[i]) continue;
+        const p = posOf(items[i]);
+        const d = (p[0] - cx) * (p[0] - cx) + (p[1] - cy) * (p[1] - cy);
+        if (d < bd) { bd = d; best = i; }
+      }
+      used[best] = 1;
+      out[k] = items[best];
+      const p = posOf(items[best]);
+      cx = p[0]; cy = p[1];
+    }
+    return out;
+  }
+
   // sRGB(0..255) → Lab
   function srgb2lab(r, g, b) {
     r /= 255; g /= 255; b /= 255;
@@ -292,6 +320,41 @@
     return out;
   }
 
+  // 变宽走廊：halfs[i] 是第 i 个点处的半宽（起笔细→中间粗→收笔细，像有笔压）
+  function ribbonProf(path, n, halfs) {
+    if (n === 1) return ribbon(path, 1, halfs[0]);
+    const dir = new Float64Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1);
+      let dx = path[b * 2] - path[a * 2], dy = path[b * 2 + 1] - path[a * 2 + 1];
+      const ln = Math.hypot(dx, dy) || 1;
+      dir[i * 2] = dx / ln; dir[i * 2 + 1] = dy / ln;
+    }
+    const left = [], right = [];
+    for (let i = 0; i < n; i++) {
+      const dx = dir[i * 2], dy = dir[i * 2 + 1];
+      const nx = -dy, ny = dx, hw = halfs[i];
+      left.push(path[i * 2] + hw * nx, path[i * 2 + 1] + hw * ny);
+      right.push(path[i * 2] - hw * nx, path[i * 2 + 1] - hw * ny);
+    }
+    const out = [];
+    out.push(...left);
+    const ex = path[(n - 1) * 2], ey = path[(n - 1) * 2 + 1], hw1 = halfs[n - 1];
+    const ea = Math.atan2(dir[(n - 1) * 2 + 1], dir[(n - 1) * 2]);
+    for (let k = 1; k <= 4; k++) {
+      const a = ea + Math.PI * k / 5;
+      out.push(ex + hw1 * Math.cos(a), ey + hw1 * Math.sin(a));
+    }
+    for (let i = n - 1; i >= 0; i--) out.push(right[i * 2], right[i * 2 + 1]);
+    const hw0 = halfs[0];
+    const sa = Math.atan2(dir[1], dir[0]);
+    for (let k = 1; k <= 4; k++) {
+      const a = sa - Math.PI * k / 5;
+      out.push(path[0] + hw0 * Math.cos(a), path[1] + hw0 * Math.sin(a));
+    }
+    return out;
+  }
+
   // ---------------- 轻度平滑（仅用于分块：median3 + 两次 box3） ----------------
   function med3(src, w, h) {
     const out = new Uint8Array(src.length);
@@ -426,7 +489,16 @@
     resStop: 0,             // 补笔收益阈值（0 = 不提前收手，把 7 轮补完）
     localColor: true,       // 主笔触按段取局部纯色（更贴近原图渐变）
     dilMain: 3,             // 主笔允许溢出 3px（自然覆盖，后画的会盖住）
-    dilInk: 2,
+    dilInk: 0,              // 勾线层不向外扩边：它现在画在铺色之后，扩边会留下压不回去的深色描边
+    // --- "像人在画"的相关参数 ---
+    sketch: true,           // 起稿阶段：先沿主要轮廓轻勾一遍（后面会被铺色盖住）
+    sketchMax: 56,          // 起稿最多勾多少条轮廓
+    sketchHalf: 1.5,        // 起稿线半宽（乘 strokeScale）
+    sketchMix: 0.45,        // 起稿色 = 局部目标色 与 铅笔灰 的混合比例
+    bleedP: 0.22,           // 多少比例的铺色笔允许"画出界"，后面再被覆盖修回
+    bleedR: 2,              // 出界的像素半径
+    organic: true,          // 单笔形态人性化：弧线 + 手抖 + 宽窄起伏
+    inkEarly: false,        // 调试开关：勾线层放到铺色之前（默认 "铺色 → 勾线收形"，见 README 的坑 4）
   };
 
   function regionMaskOf(compOf, W, compId, x0, y0, x1, y1) {
@@ -683,7 +755,9 @@
     prog(0.38, '提笔勾线…'); await yieldUI();
 
     // 8) 笔触生成
-    const strokes = [];       // {rib,tp,color,pen,ms,c(裁剪组),r(区块)}
+    const strokes = [];       // {rib,tp,color,pen,ms,c(裁剪组),r(区块),ph(阶段)}
+    const lastPen = { x: 0, y: 0 };   // 笔尖当前位置：铺色顺序按"就近"串起来
+    // 阶段：0 起稿（轻勾轮廓） 1 铺色（大块优先→收小） 2 收形（勾线+中等补笔） 3 点睛（细补笔）
     let visCanvas = null;     // 调试/测试用：最终纯色光栅结果
     let keysRgb = null;       // 关键帧（拖动进度用）
     const clips = [];         // {x,y,w,h,mask}
@@ -779,12 +853,20 @@
       return segs;
     }
 
-    function emitStroke(ribFlat, np, pathFlat, nPath, halfW, color, pen, cIdx, rIdx) {
+    function emitStroke(ribFlat, np, pathFlat, nPath, halfW, color, pen, cIdx, rIdx, ph) {
       let len = 0;
       for (let i = 1; i < nPath; i++) {
         len += Math.hypot(pathFlat[i * 2] - pathFlat[(i - 1) * 2], pathFlat[i * 2 + 1] - pathFlat[(i - 1) * 2 + 1]);
       }
-      const weight = Math.max(pen ? 26 : 22, len) * (luma(color) > 238 ? 0.25 : 1);
+      const phase = ph === undefined ? 1 : ph;
+      // 节奏：起稿又快又轻；点睛最慢最小心；其余按长度给时间（短笔也要有起步价）
+      let weight;
+      if (phase === 0) weight = 8 + len * 1.0;
+      else if (phase === 3) weight = 26 + len * 2.6;
+      else if (phase === 2) weight = 18 + len * 2.2;
+      else weight = 12 + len * 1.8;
+      weight *= 0.85 + 0.3 * rand01(len + strokes.length * 0.37, phase + 1.7);   // 每笔快慢有点起伏
+      if (luma(color) > 238) weight *= 0.3;                                      // 白底一笔带过
       const rec = {
         rib: Array.from(ribFlat, (v) => Math.round(v * 10) / 10),
         tp: Array.from(pathFlat, (v) => Math.round(v * 10) / 10),
@@ -792,14 +874,18 @@
         color: [color[0], color[1], color[2]],
         pen: pen ? 1 : 0,
         ms: weight,           // 先存权重，收尾时按目标总时长归一
-        c: cIdx, r: rIdx,
+        c: cIdx, r: rIdx, ph: phase,
       };
       strokes.push(rec);
+      if (nPath >= 1) {
+        lastPen.x = pathFlat[(nPath - 1) * 2];
+        lastPen.y = pathFlat[(nPath - 1) * 2 + 1];
+      }
       return rec;
     }
 
     // 沿路径取局部色并按"颜色相近的相邻段"合并成一笔
-    function emitLocal(path, n, halfW, clipMask, cx, cy, cw, ch, pen, cIdx, rIdx, fallback) {
+    function emitLocal(path, n, halfW, clipMask, cx, cy, cw, ch, pen, cIdx, rIdx, fallback, ph) {
       const segs = pathSegments(path, n, Math.max(30, halfW * 3));
       const cols = [];
       for (const sg of segs) {
@@ -824,23 +910,92 @@
           const rib = ribbon(arr, np, halfW);
           const col = cols[i] || fallback;
           const pn = pen < 0 ? (luma(col) < opts.inkLuma ? 1 : 0) : pen;   // -1：按色深自动
-          emitStroke(rib, rib.length / 2, arr, np, halfW, col, pn, cIdx, rIdx);
+          emitStroke(rib, rib.length / 2, arr, np, halfW, col, pn, cIdx, rIdx, ph);
         }
         i = j + 1;
       }
     }
 
-    // ---- 8a) 线稿：整层骨架 → 长路径笔（可多笔补足） ----
+    // ---- 7.5) 起稿：沿"主要轮廓"轻轻勾一遍（细、快、轻；后面铺色会盖住它，像真起稿） ----
+    prog(0.42, '起稿勾形…'); await yieldUI();
+    if (opts.sketch) {
+      let maxCid = 0;
+      for (const rg of regions) if (rg.cid > maxCid) maxCid = rg.cid;
+      const areaOf = new Int32Array(maxCid + 1);
+      for (const rg of regions) areaOf[rg.cid] = rg.area;
+      const minSide = Math.max(200, Math.round(240 * scale * scale));   // 只勾大体轮廓，不勾碎屑
+      const edge = new Uint8Array(N);
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const p = y * W + x;
+          const c0 = compOf[p], a0 = areaOf[c0] || 0;
+          let on = 0;
+          if (x + 1 < W) {
+            const c1 = compOf[p + 1];
+            if (c1 !== c0 && (a0 >= minSide || (areaOf[c1] || 0) >= minSide)) on = 1;
+          }
+          if (!on && y + 1 < H) {
+            const c2 = compOf[p + W];
+            if (c2 !== c0 && (a0 >= minSide || (areaOf[c2] || 0) >= minSide)) on = 1;
+          }
+          if (on) edge[p] = 1;
+        }
+      }
+      const ecc = compsOfLabels(edge, W, H);
+      const cand = [];
+      for (let ci = 0; ci < ecc.comps.length; ci++) {
+        if (ecc.comps[ci].label === 1 && ecc.comps[ci].count >= 12) cand.push(ci);
+      }
+      cand.sort((a, b) => ecc.comps[b].count - ecc.comps[a].count);
+      const items = cand.slice(0, opts.sketchMax).map((ci) => ({
+        ci, cx: (ecc.comps[ci].x0 + ecc.comps[ci].x1) / 2, cy: (ecc.comps[ci].y0 + ecc.comps[ci].y1) / 2,
+      }));
+      const seq = chainNN(items, (it) => [it.cx, it.cy], 0, 0);
+      const halfS = Math.max(1.1, opts.sketchHalf * strokeScale);
+      const clipPad = Math.max(1, Math.round(1.2 * strokeScale));
+      const mix = opts.sketchMix;
+      // 起稿色：局部目标色往铅笔灰里压一点——有"铅笔线"的味道，又不会留下大片深色残迹
+      const pencil = (x, y) => {
+        const xi = clamp(Math.round(x), 0, W - 1), yi = clamp(Math.round(y), 0, H - 1);
+        const p0 = yi * W + xi;
+        return [Math.round(R[p0] * (1 - mix) + 74 * mix),
+                Math.round(G[p0] * (1 - mix) + 72 * mix),
+                Math.round(B[p0] * (1 - mix) + 76 * mix)];
+      };
+      for (const it of seq) {
+        const bw = bboxOfComp(ecc, it.ci, clipPad);
+        const { sk } = thin(bw.m, bw.w, bw.h);
+        const lp = longestPath(sk, bw.w, bw.h);
+        if (!lp || lp.len < 4) continue;
+        const absPath = new Float64Array(lp.len * 2);
+        for (let i = 0; i < lp.len; i++) {
+          absPath[i * 2] = lp.pts[i * 2] + bw.x;
+          absPath[i * 2 + 1] = lp.pts[i * 2 + 1] + bw.y;
+        }
+        const mi = lp.len >> 1;
+        const col = pencil(absPath[mi * 2], absPath[mi * 2 + 1]);
+        const cIdx = pushClip(bw.x, bw.y, bw.w, bw.h, dilate(bw.m, bw.w, bw.h, clipPad));
+        const rib = ribbon(absPath, lp.len, halfS);
+        emitStroke(rib, rib.length / 2, absPath, lp.len, halfS, col, 1, cIdx, -1, 0);
+      }
+    }
+
+    // ---- 8a) 线稿：整层骨架 → 长路径笔（可多笔补足）；写在"铺色"之后执行（先铺色再勾线收形） ----
     const inkClips = [];
-    {
+    const buildInkLayer = () => {
       const icc = compsOfLabels(inkBin, W, H);
       const groups = [];
       for (let ci = 0; ci < icc.comps.length; ci++) {
         if (icc.comps[ci].label === 1 && icc.comps[ci].count >= 6) groups.push(ci);
       }
       groups.sort((a, b) => icc.comps[b].count - icc.comps[a].count);
+      // 勾线也按"就近"走：从笔尖现在的位置开始，串成一条不来回乱跳的路线
+      const gSeq = chainNN(
+        groups.slice(0, 260).map((ci) => ({ ci, cx: (icc.comps[ci].x0 + icc.comps[ci].x1) / 2, cy: (icc.comps[ci].y0 + icc.comps[ci].y1) / 2 })),
+        (g) => [g.cx, g.cy], lastPen.x, lastPen.y
+      ).map((g) => g.ci);
       let gi = 0;
-      for (const ci of groups) {
+      for (const ci of gSeq) {
         gi++;
         const bw = bboxOfComp(icc, ci, 0);              // 严格掩膜（取色用）
         const clipM = opts.dilInk > 0 ? dilate(bw.m, bw.w, bw.h, opts.dilInk) : bw.m;
@@ -879,10 +1034,10 @@
               absPath[i * 2 + 1] = lp.pts[i * 2 + 1] + bw.y;
             }
             if (opts.localColor) {
-              emitLocal(absPath, lp.len, half, bw.m, bw.x, bw.y, bw.w, bw.h, -1, cIdx, -1, inkFallback);
+              emitLocal(absPath, lp.len, half, bw.m, bw.x, bw.y, bw.w, bw.h, -1, cIdx, -1, inkFallback, 2);
             } else {
               const rib = ribbon(absPath, lp.len, half);
-              emitStroke(rib, rib.length / 2, absPath, lp.len, half, inkFallback, 1, cIdx, -1);
+              emitStroke(rib, rib.length / 2, absPath, lp.len, half, inkFallback, 1, cIdx, -1, 2);
             }
             const cover = new Uint8Array(bw.w * bw.h);
             fillPoly(cover, bw.w, bw.h, (() => {
@@ -904,30 +1059,31 @@
         }
         inkClips.push(cIdx);
       }
-    }
-    prog(0.55, '铺色块…'); await yieldUI();
+    };
+    if (opts.inkEarly) buildInkLayer();     // 调试开关：勾线放在铺色之前（旧行为）
+    prog(0.52, '铺色块…'); await yieldUI();
 
-    // ---- 8b) 非线稿区块：毛笔刷（沿主轴来回档） ----
+    // ---- 8b) 非线稿区块：毛笔刷（沿主轴一档档来回涂） ----
     const regionOrder = [];
     {
-      const bgGuess = (() => {
-        // 边角多数色 = 背景
-        let br = 0, bg = 0, bb = 0, cnt = 0;
-        const pts = [[0, 0], [W - 1, 0], [0, H - 1], [W - 1, H - 1], [W >> 1, 0], [0, H >> 1], [W - 1, H >> 1], [W >> 1, H - 1]];
-        for (const [x, y] of pts) { const p = y * W + x; br += R[p]; bg += G[p]; bb += B[p]; cnt++; }
-        return [br / cnt, bg / cnt, bb / cnt];
-      })();
       const imp = (rg) => Math.hypot(rg.color[0] - 255, rg.color[1] - 255, rg.color[2] - 255);
       const isBg = (rg) => luma(rg.color) > 240 && imp(rg) < 24;
-      for (let ri = 0; ri < regions.length; ri++) regionOrder.push(ri);
-      regionOrder.sort((a, b) => {
-        const A = regions[a], Bv = regions[b];
-        const ba = isBg(A) ? 0 : 1, bb2 = isBg(Bv) ? 0 : 1;
-        if (ba !== bb2) return ba - bb2;
-        const ia = imp(A), ib = imp(Bv);
-        if (Math.abs(ia - ib) > 1e-6) return ib - ia;
-        return Bv.area - A.area;
-      });
+      // 分层：白底先铺（纸面）→ 大色块 → 中块 → 小块；同层内按"就近"串成一条路线
+      const tierOf = (rg) => (isBg(rg) ? 99 : Math.floor(Math.log2(Math.max(2, rg.area))));
+      const list = [];
+      for (let ri = 0; ri < regions.length; ri++) if (!isInk[ri]) list.push(ri);
+      list.sort((a, b) => tierOf(regions[b]) - tierOf(regions[a]));
+      let i0 = 0;
+      while (i0 < list.length) {
+        let j0 = i0 + 1;
+        const t = tierOf(regions[list[i0]]);
+        while (j0 < list.length && tierOf(regions[list[j0]]) === t) j0++;
+        const grp = list.slice(i0, j0);
+        const seq = chainNN(grp, (ri) => [regions[ri].cx, regions[ri].cy], lastPen.x, lastPen.y);
+        for (const ri of seq) regionOrder.push(ri);
+        i0 = j0;
+      }
+      const bleedRad = Math.max(1, Math.round(opts.bleedR * strokeScale));
       for (const ri of regionOrder) {
         const rg = regions[ri];
         if (isInk[ri]) continue;
@@ -935,38 +1091,66 @@
         // 取色时把掩膜内缩 1px：避开边界上的混色像素，否则会被"拉亮"出亮边
         const sampleM = rg.area > 600 ? erode(clip.m, clip.w, clip.h, 1) : clip.m;
         const cIdx = pushClip(rg.x0, rg.y0, clip.w, clip.h, clip.m);
-        const bleedW = Math.round(opts.bleedFirst * strokeScale);
-        const cBleed = (opts.bleedFirst > 0 && bleedW > 0)
-          ? pushClip(rg.x0, rg.y0, clip.w, clip.h, dilate(clip.m, clip.w, clip.h, bleedW))
+        // 一小部分笔允许"画出界"：像人一样压到轮廓外面，后面被别的颜色覆盖回来。
+        // 只给大色块用——碎块上出界看不出"手感"，只会变成噪点、白花补笔预算。
+        const allowBleed = opts.bleedP > 0 && rg.area >= 1200;
+        const cBleed = allowBleed
+          ? pushClip(rg.x0, rg.y0, clip.w, clip.h, dilate(clip.m, clip.w, clip.h, bleedRad))
           : cIdx;
-        const ext = rg.hp * 2;
-        let bwid = clamp(ext * 0.16, 9 * strokeScale, 46 * strokeScale);
+        const ext0 = rg.hp * 2;
+        let bwid = clamp(ext0 * 0.16, 9 * strokeScale, 46 * strokeScale);
+        // 手抖/弧度是"整个区块一起漂"，不是每一档各抖一个方向——否则相邻两档会漏缝。
+        // 横向范围按最大漂移量外扩，保证区块边缘也被盖住（多出来的部分被裁形切掉）。
+        const wobA = opts.organic ? Math.min(2.8, bwid * 0.13) : Math.min(2.6, bwid * 0.1);
+        const bowA = opts.organic ? Math.min(2.4, bwid * 0.11) : 0;
+        const dev = wobA + bowA;
+        const ext = ext0 + 2 * dev;
         let nP = Math.max(1, Math.ceil(ext / (bwid * 0.62)));   // 覆盖率 ≥ 62% 重叠
         if (nP > 24) { nP = 24; bwid = Math.max(bwid, ext / (nP * 0.62)); }   // 档数封顶就加宽笔刷
         const ax = rg.ax, ay = rg.ay;
         const px2 = -ay, py2 = ax;
-        let k = 0;
-        for (let pi = 0; pi < nP; pi++) {
-          const v = -rg.hp + (pi + 0.5) * (ext / nP);
-          const wob = Math.min(2.6, bwid * 0.1) * Math.sin((pi * 1.7) % 6.28);
-          const t0 = rg.tmin - 3, t1 = rg.tmax + 3;
-          const nseg = 5;
+        const wobPh = rand01(ri * 7919 + 13, 1) * 6.283;        // 区块级相位（一起漂）
+        const wobW = 2.2 + 2.6 * rand01(ri * 7919 + 41, 9);     // 区块级波长（一起漂）
+        const bowDir = rand01(ri * 7919 + 29, 3) > 0.5 ? 1 : -1;
+        // 从笔尖近的那头起手，之后一档一档来回（不是每档都从同一头起的一排排平行线）
+        const tPen = (lastPen.x - rg.cx) * ax + (lastPen.y - rg.cy) * ay;
+        const fromPlus = tPen > 0;
+        for (let k = 0; k < nP; k++) {
+          const pi = fromPlus ? (nP - 1 - k) : k;
+          const dir = ((k % 2 === 0) !== fromPlus) ? 1 : -1;
+          const seed = ri * 7919 + pi * 104729 + k * 15485863;
+          const v = -rg.hp - dev + (pi + 0.5) * (ext / nP);
+          const bwidP = opts.organic ? bwid * (0.9 + 0.2 * rand01(seed, 11)) : bwid;
+          const wobPhP = wobPh + (rand01(seed, 1) - 0.5) * 0.7;
+          const bowP = opts.organic ? bowA * bowDir * (0.7 + 0.6 * rand01(seed, 3)) : 0;
+          const e0 = opts.organic ? (rand01(seed, 5) - 0.35) * 5 : 3;
+          const e1 = opts.organic ? (rand01(seed, 7) - 0.35) * 5 : 3;
+          const tA = dir > 0 ? rg.tmin - 2 - e0 : rg.tmax + 2 + e1;
+          const tB = dir > 0 ? rg.tmax + 2 + e1 : rg.tmin - 2 - e0;
+          const nseg = opts.organic ? 6 : 5;
           const path = new Float64Array(nseg * 2);
+          const halfs = new Float64Array(nseg);
           for (let s = 0; s < nseg; s++) {
-            const tt = t0 + (t1 - t0) * s / (nseg - 1);
-            path[s * 2] = rg.cx + ax * tt + px2 * (v + wob);
-            path[s * 2 + 1] = rg.cy + ay * tt + py2 * (v + wob);
+            const f = nseg > 1 ? s / (nseg - 1) : 0;
+            const tt = tA + (tB - tA) * f;
+            const off = v + wobA * Math.sin(wobPhP + f * wobW) + bowP * Math.sin(Math.PI * f);
+            path[s * 2] = rg.cx + ax * tt + px2 * off;
+            path[s * 2 + 1] = rg.cy + ay * tt + py2 * off;
+            // 笔压：中间略粗、两头略细，再加一点不均匀
+            halfs[s] = (bwidP / 2) * (0.86 + 0.20 * Math.sin(Math.PI * f) + 0.08 * Math.sin(wobPhP + f * 3.1));
           }
-          const useClip = (pi === 0) ? cBleed : cIdx;
+          const useClip = (opts.bleedP > 0 && rand01(seed, 13) < opts.bleedP) ? cBleed : cIdx;
           if (opts.localColor) {
-            emitLocal(path, nseg, bwid / 2, sampleM, rg.x0, rg.y0, clip.w, clip.h, 0, useClip, ri, rg.color);
+            emitLocal(path, nseg, bwidP / 2, sampleM, rg.x0, rg.y0, clip.w, clip.h, 0, useClip, ri, rg.color, 1);
           } else {
-            const rib = ribbon(path, nseg, bwid / 2);
-            emitStroke(rib, rib.length / 2, path, nseg, bwid / 2, rg.color, 0, useClip, ri);
+            const rib = opts.organic ? ribbonProf(path, nseg, halfs) : ribbon(path, nseg, bwidP / 2);
+            emitStroke(rib, rib.length / 2, path, nseg, bwidP / 2, rg.color, 0, useClip, ri, 1);
           }
         }
       }
     }
+    prog(0.70, '勾线收形…'); await yieldUI();
+    if (!opts.inkEarly) buildInkLayer();
     prog(0.78, '补笔修形…'); await yieldUI();
 
     dbg.mainStrokes = strokes.length;
@@ -1022,8 +1206,8 @@
       if (!keysOut.length || keysOut[keysOut.length - 1].i !== strokes.length) {
         keysOut.push({ i: strokes.length, rgb: canvas.slice() });
       }
-      const emitRaster = (rib, pathPts, nPath, halfW, col, pen, cIdx) => {
-        const rec = emitStroke(rib, rib.length / 2, pathPts, nPath, halfW, col, pen, cIdx, -1);
+      const emitRaster = (rib, pathPts, nPath, halfW, col, pen, cIdx, ph) => {
+        const rec = emitStroke(rib, rib.length / 2, pathPts, nPath, halfW, col, pen, cIdx, -1, ph);
         raster(rec.rib, rec.color, rec.c);
         return rec;
       };
@@ -1031,6 +1215,8 @@
       let prevPct = 999;
       for (let round = 0; round < opts.residual.length; round++) {
         if (strokes.length > opts.maxStrokes) break;
+        // 前两轮是"收形"（把轮廓/边缘修准），后面几轮是"点睛"（抠细节，手更慢更细）
+        const phR = round < 2 ? 2 : 3;
         const thr = opts.residual[round];
         let added = 0;
         // 全图错误掩膜：把"又大又厚"的错误块（大片平滑渐变差异）排除在补笔之外，
@@ -1157,7 +1343,7 @@
                     const a = k / 13 * Math.PI * 2;
                     poly.push(cx0 + rad * Math.cos(a), cy0 + rad * Math.sin(a));
                   }
-                  emitRaster(poly, [cx0, cy0], 1, rad, col, 0, cIdx);
+                  emitRaster(poly, [cx0, cy0], 1, rad, col, 0, cIdx, phR);
                   added++;
                   continue;
                 }
@@ -1195,7 +1381,7 @@
                       const arr2 = Float64Array.from(pts2);
                       if (arr2.length >= 4) {
                         const rb = ribbon(arr2, arr2.length / 2, half);
-                        emitRaster(rb, arr2, arr2.length / 2, half, cols[i2] || col, 0, cIdx);
+                        emitRaster(rb, arr2, arr2.length / 2, half, cols[i2] || col, 0, cIdx, phR);
                         added++;
                       }
                       i2 = j2 + 1;
@@ -1208,7 +1394,7 @@
                     const a = k / 13 * Math.PI * 2;
                     poly.push(cx0 + rad * Math.cos(a), cy0 + rad * Math.sin(a));
                   }
-                  emitRaster(poly, [cx0, cy0], 1, rad, col, 0, cIdx);
+                  emitRaster(poly, [cx0, cy0], 1, rad, col, 0, cIdx, phR);
                   added++;
                 }
               }
@@ -1222,7 +1408,7 @@
         }
         const pct = bad / N * 100;
         prog(0.78 + 0.2 * (round + 1) / opts.residual.length,
-             "补笔修形… 第 " + (round + 1) + " 轮（可见差异 " + pct.toFixed(2) + "%）");
+             (phR === 2 ? "收形补笔…" : "点睛补细节…") + " 第 " + (round + 1) + " 轮（可见差异 " + pct.toFixed(2) + "%）");
         if (pct < 1.0) break;
         if (opts.resStop > 0 && prevPct - pct < opts.resStop && round >= 1) break;   // 收益变小就收手
         prevPct = pct;
@@ -1233,12 +1419,12 @@
       keysRgb = keysOut;
     }
 
-    // 时长归一：回放总时长按 targetSec 分配，单笔不低于 28ms
+    // 时长归一：先按 targetSec 分配相对权重（网页端还会把"抬笔移动"的时间算进来再分一次）
     {
       let tot = 0;
       for (const st1 of strokes) tot += st1.ms;
       const k = tot > 0 ? (opts.targetSec * 1000) / tot : 1;
-      for (const st1 of strokes) st1.ms = Math.round(Math.max(14, st1.ms * k) * 10) / 10;
+      for (const st1 of strokes) st1.ms = Math.round(Math.max(6, st1.ms * k) * 10) / 10;
     }
     prog(1.0, '完成');
     return {
@@ -1261,6 +1447,7 @@
         inkGroups: inkClips.length,
         strokes: strokes.length,
         totalMs: strokes.reduce((a, s) => a + s.ms, 0),
+        phases: [0, 1, 2, 3].map((ph) => strokes.filter((s) => s.ph === ph).length),
       },
     };
   }
