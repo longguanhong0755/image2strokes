@@ -1,0 +1,1269 @@
+/* 图片 → "一笔一笔平涂" 的绘制脚本管线（纯 JS，无 DOM 依赖，可在 Worker / Node 里跑）
+ *
+ * 流程：
+ *   颜色量化 → 连通分区 → 碎块吸收 → 分区笔刷（每笔一个纯色，可按段取局部色）
+ *   → 深色细线（线稿）走骨架笔画 → 残差补笔修复（允许覆盖，越补越准）
+ *
+ * 输出的每一笔：rib 走廊多边形 + tp 笔尖轨迹 + 纯色 color + 裁剪组 c。
+ */
+(function (root) {
+  'use strict';
+
+  // ---------------- 基础工具 ----------------
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  function luma(c) { return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]; }
+
+  // sRGB(0..255) → Lab
+  function srgb2lab(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    r = r > 0.04045 ? Math.pow((r + 0.055) / 1.055, 2.4) : r / 12.92;
+    g = g > 0.04045 ? Math.pow((g + 0.055) / 1.055, 2.4) : g / 12.92;
+    b = b > 0.04045 ? Math.pow((b + 0.055) / 1.055, 2.4) : b / 12.92;
+    let X = (r * 0.4124 + g * 0.3576 + b * 0.1805) / 0.95047;
+    let Y = (r * 0.2126 + g * 0.7152 + b * 0.0722);
+    let Z = (r * 0.0193 + g * 0.1192 + b * 0.9505) / 1.08883;
+    const f = (t) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+    X = f(X); Y = f(Y); Z = f(Z);
+    return [116 * Y - 16, 500 * (X - Y), 200 * (Y - Z)];
+  }
+
+  // ---------------- 多边形扫描线填充（偶奇），写入 bbox 局部掩膜 ----------------
+  function fillPoly(mask, mw, mh, pts) {
+    const n = pts.length >> 1;
+    if (n < 3) return;
+    let ymin = Infinity, ymax = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const y = pts[i * 2 + 1];
+      if (y < ymin) ymin = y; if (y > ymax) ymax = y;
+    }
+    ymin = Math.max(0, Math.floor(ymin)); ymax = Math.min(mh - 1, Math.ceil(ymax));
+    const xs = new Float64Array(n + 1);
+    for (let y = ymin; y <= ymax; y++) {
+      const yc = y + 0.5;
+      let m = 0;
+      for (let i = 0; i < n; i++) {
+        const x0 = pts[i * 2], yy0 = pts[i * 2 + 1];
+        const j = (i + 1) % n;
+        const x1 = pts[j * 2], yy1 = pts[j * 2 + 1];
+        if ((yy0 <= yc && yy1 > yc) || (yy1 <= yc && yy0 > yc)) {
+          xs[m++] = x0 + (yc - yy0) / (yy1 - yy0) * (x1 - x0);
+        }
+      }
+      if (m < 2) continue;
+      const arr = xs.subarray(0, m);
+      arr.sort();
+      for (let k = 0; k + 1 < m; k += 2) {
+        let xa = Math.ceil(arr[k] - 0.5), xb = Math.floor(arr[k + 1] - 0.5);
+        if (xb < 0 || xa >= mw) continue;
+        if (xa < 0) xa = 0; if (xb >= mw) xb = mw - 1;
+        const row = y * mw;
+        for (let x = xa; x <= xb; x++) mask[row + x] = 1;
+      }
+    }
+  }
+
+  // ---------------- 距离变换（3×4 chamfer，近似欧氏） ----------------
+  function distanceTransform(bin, w, h) {
+    const INF = 1e9;
+    const d = new Float32Array(w * h);
+    for (let i = 0; i < w * h; i++) d[i] = bin[i] ? INF : 0;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        if (d[i] === 0) continue;
+        let v = d[i];
+        if (x > 0) v = Math.min(v, d[i - 1] + 3);
+        if (y > 0) v = Math.min(v, d[i - w] + 3);
+        if (x > 0 && y > 0) v = Math.min(v, d[i - w - 1] + 4);
+        if (x + 1 < w && y > 0) v = Math.min(v, d[i - w + 1] + 4);
+        d[i] = v;
+      }
+    }
+    for (let y = h - 1; y >= 0; y--) {
+      for (let x = w - 1; x >= 0; x--) {
+        const i = y * w + x;
+        if (d[i] === 0) continue;
+        let v = d[i];
+        if (x + 1 < w) v = Math.min(v, d[i + 1] + 3);
+        if (y + 1 < h) v = Math.min(v, d[i + w] + 3);
+        if (x + 1 < w && y + 1 < h) v = Math.min(v, d[i + w + 1] + 4);
+        if (x > 0 && y + 1 < h) v = Math.min(v, d[i + w - 1] + 4);
+        d[i] = v;
+      }
+    }
+    for (let i = 0; i < w * h; i++) d[i] /= 3;
+    return d;
+  }
+
+  // ---------------- 形态学：膨胀（方形核） ----------------
+  function dilate(bin, w, h, r) {
+    if (r <= 0) return bin.slice();
+    // 行列两次一维膨胀（方形核）
+    const tmp = new Uint8Array(w * h), out = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const row = y * w;
+      for (let x = 0; x < w; x++) {
+        let v = 0;
+        for (let k = -r; k <= r && !v; k++) {
+          const xx = x + k;
+          if (xx >= 0 && xx < w && bin[row + xx]) v = 1;
+        }
+        tmp[row + x] = v;
+      }
+    }
+    for (let x = 0; x < w; x++) {
+      for (let y = 0; y < h; y++) {
+        let v = 0;
+        for (let k = -r; k <= r && !v; k++) {
+          const yy = y + k;
+          if (yy >= 0 && yy < h && tmp[yy * w + x]) v = 1;
+        }
+        out[y * w + x] = v;
+      }
+    }
+    return out;
+  }
+
+  // ---------------- 腐蚀（膨胀的对偶） ----------------
+  function erode(bin, w, h, r) {
+    const inv = new Uint8Array(w * h);
+    for (let i = 0; i < inv.length; i++) inv[i] = bin[i] ? 0 : 1;
+    const d = dilate(inv, w, h, r);
+    const out = new Uint8Array(w * h);
+    for (let i = 0; i < out.length; i++) out[i] = d[i] ? 0 : 1;
+    return out;
+  }
+
+  // ---------------- 连通域（给定标签图，4 连通，只保留"同标签"连通） ----------------
+  function compsOfLabels(labels, W, H) {
+    const compOf = new Int32Array(W * H).fill(-1);
+    const pix = new Uint32Array(W * H);
+    const comps = [];
+    const q = new Int32Array(W * H);
+    let np = 0;
+    for (let s = 0; s < W * H; s++) {
+      if (compOf[s] >= 0) continue;
+      const lab = labels[s];
+      const id = comps.length;
+      let head = 0, tail = 0;
+      q[tail++] = s; compOf[s] = id;
+      const start = np;
+      let x0 = W, y0 = H, x1 = -1, y1 = -1;
+      while (head < tail) {
+        const p = q[head++];
+        pix[np++] = p;
+        const x = p % W, y = (p - x) / W;
+        if (x < x0) x0 = x; if (x > x1) x1 = x;
+        if (y < y0) y0 = y; if (y > y1) y1 = y;
+        if (x > 0 && compOf[p - 1] < 0 && labels[p - 1] === lab) { compOf[p - 1] = id; q[tail++] = p - 1; }
+        if (x + 1 < W && compOf[p + 1] < 0 && labels[p + 1] === lab) { compOf[p + 1] = id; q[tail++] = p + 1; }
+        if (y > 0 && compOf[p - W] < 0 && labels[p - W] === lab) { compOf[p - W] = id; q[tail++] = p - W; }
+        if (y + 1 < H && compOf[p + W] < 0 && labels[p + W] === lab) { compOf[p + W] = id; q[tail++] = p + W; }
+      }
+      comps.push({ label: lab, start, count: np - start, x0, y0, x1, y1 });
+    }
+    return { compOf, pix, comps };
+  }
+
+  // ---------------- 细化（Zhang-Suen，4/8 连通骨架） ----------------
+  function thin(bin, w, h) {
+    const im = bin.slice();
+    let changedTotal = false;
+    for (let iter = 0; iter < 100; iter++) {
+      let changed = false;
+      for (let step = 0; step < 2; step++) {
+        const del = [];
+        for (let y = 1; y < h - 1; y++) {
+          for (let x = 1; x < w - 1; x++) {
+            const i = y * w + x;
+            if (!im[i]) continue;
+            const p2 = im[i - w], p3 = im[i - w + 1], p4 = im[i + 1], p5 = im[i + w + 1],
+                  p6 = im[i + w], p7 = im[i + w - 1], p8 = im[i - 1], p9 = im[i - w - 1];
+            const B = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
+            if (B < 2 || B > 6) continue;
+            const seq = [p2, p3, p4, p5, p6, p7, p8, p9, p2];
+            let A = 0;
+            for (let k = 0; k < 8; k++) if (seq[k] === 0 && seq[k + 1] === 1) A++;
+            if (A !== 1) continue;
+            if (step === 0) {
+              if (p2 * p4 * p6 !== 0) continue;
+              if (p4 * p6 * p8 !== 0) continue;
+            } else {
+              if (p2 * p4 * p8 !== 0) continue;
+              if (p2 * p6 * p8 !== 0) continue;
+            }
+            del.push(i);
+          }
+        }
+        if (del.length) {
+          for (const i of del) im[i] = 0;
+          changed = true;
+        }
+      }
+      if (changed) changedTotal = true; else break;
+    }
+    return { sk: im, changed: changedTotal };
+  }
+
+  // ---------------- 骨架最长路径（两次 BFS） ----------------
+  function longestPath(sk, w, h) {
+    const idx = [];
+    for (let i = 0; i < w * h; i++) if (sk[i]) idx.push(i);
+    if (!idx.length) return null;
+    const dist = new Int32Array(w * h).fill(-1);
+    const par = new Int32Array(w * h).fill(-1);
+    const q = new Int32Array(idx.length);
+    const bfs = (s) => {
+      dist.fill(-1); par.fill(-1);
+      let head = 0, tail = 0, far = s;
+      q[tail++] = s; dist[s] = 0;
+      while (head < tail) {
+        const p = q[head++];
+        const x = p % w, y = (p - x) / w;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (!dx && !dy) continue;
+            const xx = x + dx, yy = y + dy;
+            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+            const n = yy * w + xx;
+            if (!sk[n] || dist[n] >= 0) continue;
+            dist[n] = dist[p] + 1; par[n] = p;
+            if (dist[n] > dist[far]) far = n;
+            q[tail++] = n;
+          }
+        }
+      }
+      return far;
+    };
+    const a = bfs(idx[0]);
+    const b = bfs(a);
+    const path = [];
+    let cur = b;
+    while (cur >= 0) { path.push(cur); cur = par[cur]; }
+    const pts = new Float64Array(path.length * 2);
+    for (let i = 0; i < path.length; i++) {
+      const p = path[path.length - 1 - i];
+      pts[i * 2] = p % w; pts[i * 2 + 1] = (p - (p % w)) / w;
+    }
+    return { pts, len: path.length };
+  }
+
+  // ---------------- 走廊多边形（沿路径左右偏移） ----------------
+  function ribbon(path, n, halfW) {
+    // path: flat [x0,y0,...]（绝对坐标）, 返回 flat 多边形
+    if (n === 1) {
+      const out = [];
+      for (let k = 0; k < 13; k++) {
+        const a = k / 13 * Math.PI * 2;
+        out.push(path[0] + halfW * Math.cos(a), path[1] + halfW * Math.sin(a));
+      }
+      return out;
+    }
+    const dir = new Float64Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1);
+      let dx = path[b * 2] - path[a * 2], dy = path[b * 2 + 1] - path[a * 2 + 1];
+      const ln = Math.hypot(dx, dy) || 1;
+      dir[i * 2] = dx / ln; dir[i * 2 + 1] = dy / ln;
+    }
+    const left = [], right = [];
+    for (let i = 0; i < n; i++) {
+      const dx = dir[i * 2], dy = dir[i * 2 + 1];
+      const nx = -dy, ny = dx;
+      left.push(path[i * 2] + halfW * nx, path[i * 2 + 1] + halfW * ny);
+      right.push(path[i * 2] - halfW * nx, path[i * 2 + 1] - halfW * ny);
+    }
+    const out = [];
+    out.push(...left);
+    // 末端圆头
+    const ex = path[(n - 1) * 2], ey = path[(n - 1) * 2 + 1];
+    const ea = Math.atan2(dir[(n - 1) * 2 + 1], dir[(n - 1) * 2]);
+    for (let k = 1; k <= 4; k++) {
+      const a = ea + Math.PI * k / 5;
+      out.push(ex + halfW * Math.cos(a), ey + halfW * Math.sin(a));
+    }
+    for (let i = n - 1; i >= 0; i--) out.push(right[i * 2], right[i * 2 + 1]);
+    const sa = Math.atan2(dir[1], dir[0]);
+    for (let k = 1; k <= 4; k++) {
+      const a = sa - Math.PI * k / 5;
+      out.push(path[0] + halfW * Math.cos(a), path[1] + halfW * Math.sin(a));
+    }
+    return out;
+  }
+
+  // ---------------- 轻度平滑（仅用于分块：median3 + 两次 box3） ----------------
+  function med3(src, w, h) {
+    const out = new Uint8Array(src.length);
+    const win = new Uint8Array(9);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let n = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= h) continue;
+          const row = yy * w;
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= w) continue;
+            win[n++] = src[row + xx];
+          }
+        }
+        // 9 元以内插入排序
+        for (let i = 1; i < n; i++) {
+          const v = win[i];
+          let j = i - 1;
+          while (j >= 0 && win[j] > v) { win[j + 1] = win[j]; j--; }
+          win[j + 1] = v;
+        }
+        out[y * w + x] = win[n >> 1];
+      }
+    }
+    return out;
+  }
+
+  function box3(src, w, h) {
+    const out = new Uint8Array(src.length);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let acc = 0, cnt = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= h) continue;
+          const row = yy * w;
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= w) continue;
+            acc += src[row + xx]; cnt++;
+          }
+        }
+        out[y * w + x] = (acc / cnt + 0.5) | 0;
+      }
+    }
+    return out;
+  }
+
+  // ---------------- 1px 柔边（3×3 二项核，模拟画笔落笔边缘） ----------------
+  function feather(m, w, h) {
+    const out = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let acc = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= h) continue;
+          const wy = dy === 0 ? 2 : 1;
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= w) continue;
+            if (m[yy * w + xx]) acc += wy * (dx === 0 ? 2 : 1);
+          }
+        }
+        out[y * w + x] = acc / 16;
+      }
+    }
+    return out;
+  }
+
+  // ---------------- k-means（Lab 空间） ----------------
+  function kmeans(samples, K, iters, seed) {
+    let s = seed >>> 0;
+    const rnd = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
+    const n = samples.length / 3;
+    const cen = new Float64Array(K * 3);
+    for (let k = 0; k < K; k++) {
+      const i = Math.floor(rnd() * n) * 3;
+      cen[k * 3] = samples[i]; cen[k * 3 + 1] = samples[i + 1]; cen[k * 3 + 2] = samples[i + 2];
+    }
+    const asg = new Int32Array(n);
+    for (let it = 0; it < iters; it++) {
+      let moved = 0;
+      for (let i = 0; i < n; i++) {
+        const L = samples[i * 3], A = samples[i * 3 + 1], B = samples[i * 3 + 2];
+        let best = 0, bd = Infinity;
+        for (let k = 0; k < K; k++) {
+          const dL = L - cen[k * 3], dA = A - cen[k * 3 + 1], dB = B - cen[k * 3 + 2];
+          const d = dL * dL + dA * dA + dB * dB;
+          if (d < bd) { bd = d; best = k; }
+        }
+        if (asg[i] !== best) { asg[i] = best; moved++; }
+      }
+      const sum = new Float64Array(K * 3), cnt = new Int32Array(K);
+      for (let i = 0; i < n; i++) {
+        const k = asg[i];
+        sum[k * 3] += samples[i * 3]; sum[k * 3 + 1] += samples[i * 3 + 1]; sum[k * 3 + 2] += samples[i * 3 + 2];
+        cnt[k]++;
+      }
+      for (let k = 0; k < K; k++) {
+        if (cnt[k] >= 4) {
+          cen[k * 3] = sum[k * 3] / cnt[k];
+          cen[k * 3 + 1] = sum[k * 3 + 1] / cnt[k];
+          cen[k * 3 + 2] = sum[k * 3 + 2] / cnt[k];
+        }
+      }
+      if (moved < n * 0.001) break;
+    }
+    return { cen, asg };
+  }
+
+  // ---------------- 主流程 ----------------
+  const CFG = {
+    maxSide: 1024,
+    colors: 32,
+    mergeThr: 9.0,          // Lab 距离，小于它合并（对渐变友好）
+    minArea: 120,           // 小于它的小碎块并入邻块（越小分区越细，笔数越多）
+    targetSec: 240,         // 回放总时长（1× 速度）
+    bleedFirst: 0,          // 每个区块第一遍"铺底"允许外扩的像素（0 = 严格裁形，保真优先）
+    resThick: 8,            // 补笔忽略"又大又厚"的错误块（那是平涂风格本身的平滑差异）
+    inkLuma: 195,
+    coverOk: 0.86,
+    residual: [30, 24, 18, 14, 11, 9, 7],
+    absorbCd: 60,           // 碎块并入邻块的颜色阈值（Lab/RGB 距离）
+    resHalfA: 0.95, resHalfB: 0.7, resMin: 1.0,   // 补笔半宽 = dmed*A + B
+    maxStrokes: 13000,      // 总笔数上限（照片类纹理太碎时保护）
+    returnKeys: true,       // 生成关键帧（网页端拖动进度用）
+    keyFrames: 5,
+    resStop: 0,             // 补笔收益阈值（0 = 不提前收手，把 7 轮补完）
+    localColor: true,       // 主笔触按段取局部纯色（更贴近原图渐变）
+    dilMain: 3,             // 主笔允许溢出 3px（自然覆盖，后画的会盖住）
+    dilInk: 2,
+  };
+
+  function regionMaskOf(compOf, W, compId, x0, y0, x1, y1) {
+    const w = x1 - x0 + 1, h = y1 - y0 + 1;
+    const m = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) m[y * w + x] = compOf[(y + y0) * W + (x + x0)] === compId ? 1 : 0;
+    }
+    return { w, h, m };
+  }
+
+  async function run(px, W, H, opts, onProgress) {
+    opts = Object.assign({}, CFG, opts || {});
+    const yieldUI = () => new Promise((r) => setTimeout(r, 0));
+    const prog = (p, msg) => { if (onProgress) onProgress(p, msg); };
+
+    const N = W * H;
+    const R = new Uint8Array(N), G = new Uint8Array(N), B = new Uint8Array(N);
+    for (let i = 0; i < N; i++) { R[i] = px[i * 4]; G[i] = px[i * 4 + 1]; B[i] = px[i * 4 + 2]; }
+    // 分块用的平滑图（取色与差异仍用原图）。
+    // 先 median3 去噪点；再看"纹理强度"决定要不要再模糊（照片才需要，插画保持线条锐利）
+    let Rs = med3(R, W, H), Gs = med3(G, W, H), Bs = med3(B, W, H);
+    {
+      let diff = 0;
+      for (let i = 0; i < N; i++) {
+        const d = Math.abs(Rs[i] - R[i]) + Math.abs(Gs[i] - G[i]) + Math.abs(Bs[i] - B[i]);
+        if (d > 36) diff++;
+      }
+      const texFrac = diff / N;
+      if (texFrac > 0.06) {
+        Rs = box3(box3(Rs, W, H), W, H);
+        Gs = box3(box3(Gs, W, H), W, H);
+        Bs = box3(box3(Bs, W, H), W, H);
+      }
+      var texFracOut = texFrac;
+    }
+
+    prog(0.02, '分析颜色…'); await yieldUI();
+
+    // 1) Lab + k-means（隔点采样加速）
+    const step = Math.max(1, Math.round(Math.sqrt(N / 220000)));
+    const nS = Math.ceil(N / step);
+    const samp = new Float32Array(nS * 3);
+    let ns = 0;
+    for (let i = 0; i < N; i += step) {
+      const lab = srgb2lab(Rs[i], Gs[i], Bs[i]);
+      samp[ns * 3] = lab[0]; samp[ns * 3 + 1] = lab[1]; samp[ns * 3 + 2] = lab[2];
+      ns++;
+    }
+    const { cen } = kmeans(samp.subarray(0, ns * 3), opts.colors, 12, 12345);
+    const cenRaw = Array.from(cen, (v) => Math.round(v));
+
+    // 2) 归并相近中心（领袖聚类）→ 调色板（RGB 由样本均值给出）
+    const K = opts.colors;
+    const pai = new Int32Array(K).fill(-1);
+    const pal = [];
+    for (let k = 0; k < K; k++) {
+      let hit = -1;
+      for (let p = 0; p < pal.length; p++) {
+        const d = Math.hypot(cen[k * 3] - pal[p][0], cen[k * 3 + 1] - pal[p][1], cen[k * 3 + 2] - pal[p][2]);
+        if (d < opts.mergeThr) { hit = p; break; }
+      }
+      if (hit < 0) { pal.push([cen[k * 3], cen[k * 3 + 1], cen[k * 3 + 2], 0]); hit = pal.length - 1; }
+      pai[k] = hit;
+    }
+    // 中心 → 代表 RGB（用该中心附近的像素均值）
+    {
+      const accR = new Float64Array(pal.length), accG = new Float64Array(pal.length),
+            accB = new Float64Array(pal.length), cnt = new Float64Array(pal.length);
+      for (let i = 0; i < N; i++) {
+        const lab = srgb2lab(Rs[i], Gs[i], Bs[i]);
+        let best = 0, bd = Infinity;
+        for (let k = 0; k < K; k++) {
+          const dL = lab[0] - cen[k * 3], dA = lab[1] - cen[k * 3 + 1], dB = lab[2] - cen[k * 3 + 2];
+          const d = dL * dL + dA * dA + dB * dB;
+          if (d < bd) { bd = d; best = k; }
+        }
+        const p = pai[best];
+        accR[p] += R[i]; accG[p] += G[i]; accB[p] += B[i]; cnt[p]++;
+      }
+      for (let p = 0; p < pal.length; p++) {
+        if (cnt[p] > 0) { pal[p][0] = accR[p] / cnt[p]; pal[p][1] = accG[p] / cnt[p]; pal[p][2] = accB[p] / cnt[p]; }
+      }
+    }
+    prog(0.16, '分块…'); await yieldUI();
+
+    // 3) 全图归类
+    const labels = new Uint8Array(N);
+    for (let i = 0; i < N; i++) {
+      const lab = srgb2lab(Rs[i], Gs[i], Bs[i]);
+      let best = 0, bd = Infinity;
+      for (let k = 0; k < K; k++) {
+        const dL = lab[0] - cen[k * 3], dA = lab[1] - cen[k * 3 + 1], dB = lab[2] - cen[k * 3 + 2];
+        const d = dL * dL + dA * dA + dB * dB;
+        if (d < bd) { bd = d; best = k; }
+      }
+      labels[i] = pai[best];
+    }
+
+    // 4) 连通域
+    let { compOf, pix, comps } = compsOfLabels(labels, W, H);
+
+    // 5) 碎块吸收（并到颜色最近、面积最大的邻块）
+    const oldComps = comps;
+    {
+      const parent = new Int32Array(comps.length);
+      for (let i = 0; i < comps.length; i++) parent[i] = i;
+      const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+      let nSmall = 0, nMerged = 0, nNoVote = 0, nFar = 0, nNaN = 0;
+      for (let round = 0; round < 2; round++) {
+        const votes = new Map();
+        for (let ci = 0; ci < comps.length; ci++) {
+          if (find(ci) !== ci) continue;
+          const c = comps[ci];
+          if (c.count >= opts.minArea) continue;
+          nSmall++;
+          votes.clear();
+          for (let k = 0; k < c.count; k++) {
+            const p = pix[c.start + k];
+            const x = p % W, y = (p - x) / W;
+            for (let dy = -1; dy <= 1; dy++) {
+              for (let dx = -1; dx <= 1; dx++) {
+                if (!dx && !dy) continue;
+                const xx = x + dx, yy = y + dy;
+                if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+                const cj = find(compOf[yy * W + xx]);
+                if (cj === ci) continue;
+                votes.set(cj, (votes.get(cj) || 0) + 1);
+              }
+            }
+          }
+          let bestJ = -1, bestScore = -1;
+          for (const [cj, v] of votes) {
+            const pj = pal[comps[cj].label], pi = pal[c.label];
+            const cd = Math.hypot(pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]);
+            const score = v / (1 + cd * 0.5);
+            if (score > bestScore) { bestScore = score; bestJ = cj; }
+          }
+          if (bestJ < 0) { nNoVote++; continue; }
+          const pj = pal[comps[bestJ].label], pi = pal[c.label];
+          if (!pj || !pi) { nNaN++; continue; }
+          const cd = Math.hypot(pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]);
+          if (c.count < 6 || cd <= opts.absorbCd) { parent[ci] = bestJ; nMerged++; } else nFar++;
+        }
+      }
+      if (opts.debug) console.log(`[absorb] comps=${comps.length} small=${nSmall} merged=${nMerged} noVote=${nNoVote} far=${nFar} nan=${nNaN} pal=${pal.length}`);
+      // 重贴标签
+      const rootOf = new Int32Array(comps.length);
+      for (let i = 0; i < comps.length; i++) rootOf[i] = find(i);
+      const L2 = new Uint32Array(N);
+      for (let i = 0; i < N; i++) L2[i] = rootOf[compOf[i]] + 1;
+      const cc = compsOfLabels(L2, W, H);
+      compOf = cc.compOf; pix = cc.pix; comps = cc.comps;
+      for (const c of comps) {
+        const oldIdx = c.label - 1;
+        c.palLabel = oldComps[oldIdx] ? oldComps[oldIdx].label : c.label - 1;
+      }
+    }
+
+    // 6) 区块统计（面积/重心/PCA/包围盒掩膜）
+    prog(0.28, '整理区块…'); await yieldUI();
+    const regions = [];
+    for (let ci = 0; ci < comps.length; ci++) {
+      const c = comps[ci];
+      const n = c.count;
+      let sx = 0, sy = 0;
+      for (let k = 0; k < n; k++) {
+        const p = pix[c.start + k];
+        const x = p % W; sx += x; sy += (p - x) / W;
+      }
+      const cx = sx / n, cy = sy / n;
+      let sxx = 0, sxy = 0, syy = 0;
+      for (let k = 0; k < n; k++) {
+        const p = pix[c.start + k];
+        const x = p % W, y = (p - x) / W;
+        const dx = x - cx, dy = y - cy;
+        sxx += dx * dx; sxy += dx * dy; syy += dy * dy;
+      }
+      sxx /= n; sxy /= n; syy /= n;
+      const tr = sxx + syy, det = sxx * syy - sxy * sxy;
+      const l1 = tr / 2 + Math.sqrt(Math.max(0, tr * tr / 4 - det));
+      const l2 = tr / 2 - Math.sqrt(Math.max(0, tr * tr / 4 - det));
+      const ang = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+      let ax = Math.cos(ang), ay = Math.sin(ang);
+      // 让主轴方向落在"更长"的一侧
+      let tmin = Infinity, tmax = -Infinity, vmax = 0;
+      const nx = -ay, ny = ax;
+      for (let k = 0; k < n; k++) {
+        const p = pix[c.start + k];
+        const x = p % W, y = (p - x) / W;
+        const t = (x - cx) * ax + (y - cy) * ay;
+        const v = Math.abs((x - cx) * nx + (y - cy) * ny);
+        if (t < tmin) tmin = t;
+        if (t > tmax) tmax = t;
+        if (v > vmax) vmax = v;
+      }
+      if (tmax - tmin < 2 * vmax) { ax = nx; ay = ny; let tn = Infinity, tx = -Infinity, vm = 0; }
+      // 用最终轴重算范围
+      {
+        const nx2 = -ay, ny2 = ax;
+        let t2min = Infinity, t2max = -Infinity, v2max = 0, v2s = [];
+        for (let k = 0; k < n; k++) {
+          const p = pix[c.start + k];
+          const x = p % W, y = (p - x) / W;
+          const t = (x - cx) * ax + (y - cy) * ay;
+          const v = Math.abs((x - cx) * nx2 + (y - cy) * ny2);
+          if (t < t2min) t2min = t;
+          if (t > t2max) t2max = t;
+          if (v > v2max) v2max = v;
+        }
+        tmin = t2min; tmax = t2max; vmax = v2max;
+      }
+      let sr = 0, sg = 0, sb = 0;
+      for (let k = 0; k < n; k++) {
+        const p = pix[c.start + k];
+        sr += R[p]; sg += G[p]; sb += B[p];
+      }
+      const color = [sr / n, sg / n, sb / n];
+      regions.push({
+        cid: ci, x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1, area: n,
+        cx, cy, ax, ay, tmin, tmax, hp: Math.max(1, vmax),
+        color: [Math.round(color[0]), Math.round(color[1]), Math.round(color[2])],
+        pix0: c.start, pix1: c.start + n - 1,
+      });
+    }
+
+    // 7) 线稿区块（深 + 细）→ 并集
+    const inkBin = new Uint8Array(N);
+    const isInk = new Uint8Array(regions.length);
+    const dbg = { dark: 0, darkThin: 0, pal: [], cen: cenRaw, tex: texFracOut, smallLeft: regions.filter((r) => r.area < opts.minArea).length };
+    const scale = W / 1024;
+    const thinLimit = 6.5 * scale;
+    for (let ri = 0; ri < regions.length; ri++) {
+      const rg = regions[ri];
+      if (rg.area < 12) continue;
+      const bwW = rg.x1 - rg.x0 + 1, bwH = rg.y1 - rg.y0 + 1;
+      const bin = new Uint8Array(bwW * bwH);
+      for (let k = 0; k < rg.area; k++) {
+        const p = pix[rg.pix0 + k];
+        const x = p % W, y = (p - x) / W;
+        bin[(y - rg.y0) * bwW + (x - rg.x0)] = 1;
+      }
+      const dt = distanceTransform(bin, bwW, bwH);
+      let dmax = 0;
+      for (let i = 0; i < dt.length; i++) if (dt[i] > dmax) dmax = dt[i];
+      const maxr = Math.min(dmax, 0.5 * Math.min(bwW, bwH), 14 * scale) + 1.8 * scale;
+      dbg.dark++;
+      if (maxr <= thinLimit) {
+        dbg.darkThin++;
+        isInk[ri] = 1;
+        for (let k = 0; k < rg.area; k++) inkBin[pix[rg.pix0 + k]] = 1;
+      }
+    }
+    prog(0.38, '提笔勾线…'); await yieldUI();
+
+    // 8) 笔触生成
+    const strokes = [];       // {rib,tp,color,pen,ms,c(裁剪组),r(区块)}
+    let visCanvas = null;     // 调试/测试用：最终纯色光栅结果
+    let keysRgb = null;       // 关键帧（拖动进度用）
+    const clips = [];         // {x,y,w,h,mask}
+    const target = { R, G, B };
+    const strokeScale = Math.max(0.5, scale);
+
+    const pushClip = (x, y, w, h, mask) => {
+      clips.push({ x, y, w, h, mask });
+      return clips.length - 1;
+    };
+
+    function bboxOfComp(cc, ci, pad) {
+      const c = cc.comps[ci];
+      const x = Math.max(0, c.x0 - pad), y = Math.max(0, c.y0 - pad);
+      const x1 = Math.min(W - 1, c.x1 + pad), y1 = Math.min(H - 1, c.y1 + pad);
+      const w = x1 - x + 1, h = y1 - y + 1;
+      const m = new Uint8Array(w * h);
+      for (let k = 0; k < c.count; k++) {
+        const p = cc.pix[c.start + k];
+        const px0 = p % W, py0 = (p - px0) / W;
+        if (px0 < x || py0 < y || px0 > x1 || py0 > y1) continue;
+        m[(py0 - y) * w + (px0 - x)] = 1;
+      }
+      return { x, y, w, h, m };
+    }
+
+    // 采样：某个多边形在某个掩膜内的目标平均色
+    const segTmp = { w: 0, h: 0, m: null };
+    function sampleColor(polyFlat, np, clipMask, clipX, clipY, clipW, clipH) {
+      let xmin = Infinity, ymin = Infinity, xmax = -Infinity, ymax = -Infinity;
+      for (let i = 0; i < np; i++) {
+        const x = polyFlat[i * 2], y = polyFlat[i * 2 + 1];
+        if (x < xmin) xmin = x; if (x > xmax) xmax = x;
+        if (y < ymin) ymin = y; if (y > ymax) ymax = y;
+      }
+      const mw = Math.max(1, Math.ceil(xmax - Math.floor(xmin)) + 1);
+      const mh = Math.max(1, Math.ceil(ymax - Math.floor(ymin)) + 1);
+      if (mw * mh > 4000000) return null;
+      const ox = Math.floor(xmin), oy = Math.floor(ymin);
+      const local = new Uint8Array(mw * mh);
+      const pts = new Float64Array(np * 2);
+      for (let i = 0; i < np; i++) { pts[i * 2] = polyFlat[i * 2] - ox; pts[i * 2 + 1] = polyFlat[i * 2 + 1] - oy; }
+      fillPoly(local, mw, mh, pts);
+      let sr = 0, sg = 0, sb = 0, cnt = 0;
+      for (let y = 0; y < mh; y++) {
+        const gy = oy + y;
+        if (gy < clipY || gy >= clipY + clipH || gy < 0 || gy >= H) continue;
+        for (let x = 0; x < mw; x++) {
+          if (!local[y * mw + x]) continue;
+          const gx = ox + x;
+          if (gx < clipX || gx >= clipX + clipW || gx < 0 || gx >= W) continue;
+          if (!clipMask[(gy - clipY) * clipW + (gx - clipX)]) continue;
+          const p = gy * W + gx;
+          sr += target.R[p]; sg += target.G[p]; sb += target.B[p];
+          cnt++;
+        }
+      }
+      if (cnt < 4) return null;
+      return [Math.round(sr / cnt), Math.round(sg / cnt), Math.round(sb / cnt)];
+    }
+
+    function pathSegments(path, n, segLen) {
+      if (n < 2) return [{ pts: Float64Array.from([path[0], path[1]]), n: 1, len: 0 }];
+      const cum = new Float64Array(n);
+      for (let i = 1; i < n; i++) {
+        cum[i] = cum[i - 1] + Math.hypot(path[i * 2] - path[(i - 1) * 2],
+                                         path[i * 2 + 1] - path[(i - 1) * 2 + 1]);
+      }
+      const total = cum[n - 1];
+      if (total <= 1e-6) return [{ pts: Float64Array.from([path[0], path[1]]), n: 1, len: 0 }];
+      const at = (t) => {
+        let i = 1;
+        while (i < n - 1 && cum[i] < t) i++;
+        const f = (t - cum[i - 1]) / Math.max(1e-6, cum[i] - cum[i - 1]);
+        return [path[(i - 1) * 2] + (path[i * 2] - path[(i - 1) * 2]) * f,
+                path[(i - 1) * 2 + 1] + (path[i * 2 + 1] - path[(i - 1) * 2 + 1]) * f];
+      };
+      const segs = [];
+      const step = Math.max(4, segLen);
+      let s0 = 0;
+      while (s0 < total - 1e-6) {
+        const e = Math.min(total, s0 + step);
+        const pts = [];
+        const p0 = at(s0), p1 = at(e);
+        pts.push(p0[0], p0[1]);
+        for (let k = 1; k < n - 1; k++) {
+          if (cum[k] > s0 + 1e-6 && cum[k] < e - 1e-6) pts.push(path[k * 2], path[k * 2 + 1]);
+        }
+        pts.push(p1[0], p1[1]);
+        segs.push({ pts: Float64Array.from(pts), n: pts.length >> 1, len: e - s0 });
+        s0 = e;
+      }
+      return segs;
+    }
+
+    function emitStroke(ribFlat, np, pathFlat, nPath, halfW, color, pen, cIdx, rIdx) {
+      let len = 0;
+      for (let i = 1; i < nPath; i++) {
+        len += Math.hypot(pathFlat[i * 2] - pathFlat[(i - 1) * 2], pathFlat[i * 2 + 1] - pathFlat[(i - 1) * 2 + 1]);
+      }
+      const weight = Math.max(pen ? 26 : 22, len) * (luma(color) > 238 ? 0.25 : 1);
+      const rec = {
+        rib: Array.from(ribFlat, (v) => Math.round(v * 10) / 10),
+        tp: Array.from(pathFlat, (v) => Math.round(v * 10) / 10),
+        w: Math.round(halfW * 2 * 10) / 10,
+        color: [color[0], color[1], color[2]],
+        pen: pen ? 1 : 0,
+        ms: weight,           // 先存权重，收尾时按目标总时长归一
+        c: cIdx, r: rIdx,
+      };
+      strokes.push(rec);
+      return rec;
+    }
+
+    // 沿路径取局部色并按"颜色相近的相邻段"合并成一笔
+    function emitLocal(path, n, halfW, clipMask, cx, cy, cw, ch, pen, cIdx, rIdx, fallback) {
+      const segs = pathSegments(path, n, Math.max(30, halfW * 3));
+      const cols = [];
+      for (const sg of segs) {
+        if (sg.n < 2) { cols.push(null); continue; }
+        const rb = ribbon(sg.pts, sg.n, halfW);
+        cols.push(sampleColor(rb, rb.length / 2, clipMask, cx, cy, cw, ch) || fallback);
+      }
+      let i = 0;
+      while (i < segs.length) {
+        let j = i;
+        while (j + 1 < segs.length && cols[j + 1] && cols[i] &&
+               Math.abs(cols[j + 1][0] - cols[i][0]) + Math.abs(cols[j + 1][1] - cols[i][1]) +
+               Math.abs(cols[j + 1][2] - cols[i][2]) < 42) j++;
+        const pts = [];
+        for (let k = i; k <= j; k++) {
+          const P = segs[k].pts;
+          for (let m = 0; m < P.length; m++) pts.push(P[m]);
+        }
+        const arr = Float64Array.from(pts);
+        const np = arr.length / 2;
+        if (np >= 2) {
+          const rib = ribbon(arr, np, halfW);
+          const col = cols[i] || fallback;
+          const pn = pen < 0 ? (luma(col) < opts.inkLuma ? 1 : 0) : pen;   // -1：按色深自动
+          emitStroke(rib, rib.length / 2, arr, np, halfW, col, pn, cIdx, rIdx);
+        }
+        i = j + 1;
+      }
+    }
+
+    // ---- 8a) 线稿：整层骨架 → 长路径笔（可多笔补足） ----
+    const inkClips = [];
+    {
+      const icc = compsOfLabels(inkBin, W, H);
+      const groups = [];
+      for (let ci = 0; ci < icc.comps.length; ci++) {
+        if (icc.comps[ci].label === 1 && icc.comps[ci].count >= 6) groups.push(ci);
+      }
+      groups.sort((a, b) => icc.comps[b].count - icc.comps[a].count);
+      let gi = 0;
+      for (const ci of groups) {
+        gi++;
+        const bw = bboxOfComp(icc, ci, 0);              // 严格掩膜（取色用）
+        const clipM = opts.dilInk > 0 ? dilate(bw.m, bw.w, bw.h, opts.dilInk) : bw.m;
+        const full = new Uint8Array(W * H);
+        for (let k = 0; k < icc.comps[ci].count; k++) full[icc.pix[icc.comps[ci].start + k]] = 1;
+        const cIdx = pushClip(bw.x, bw.y, bw.w, bw.h, clipM);
+        let inkFallback = [46, 46, 52];
+        {
+          let sr0 = 0, sg0 = 0, sb0 = 0, n0 = 0;
+          for (let k = 0; k < icc.comps[ci].count; k++) {
+            const pp0 = icc.pix[icc.comps[ci].start + k];
+            sr0 += R[pp0]; sg0 += G[pp0]; sb0 += B[pp0]; n0++;
+          }
+          if (n0) inkFallback = [Math.round(sr0 / n0), Math.round(sg0 / n0), Math.round(sb0 / n0)];
+        }
+        const bin = new Uint8Array(bw.w * bw.h);
+        for (let y = 0; y < bw.h; y++) {
+          for (let x = 0; x < bw.w; x++) bin[y * bw.w + x] = full[(y + bw.y) * W + (x + bw.x)];
+        }
+        const dt = distanceTransform(bin, bw.w, bw.h);
+        let dmax = 0;
+        for (let i = 0; i < dt.length; i++) if (dt[i] > dmax) dmax = dt[i];
+        const half = clamp(dmax + 1.4 * strokeScale, 2.0, 12 * strokeScale);
+        // 分支队列：每画一条最长骨架路径，就把剩下没盖住的连通块继续排队，
+        // 直到整层线稿都被笔画覆盖（复杂线稿会有很多分支）
+        const queue = [bin.slice()];
+        let guard = 0;
+        while (queue.length && guard++ < 60) {
+          const m0 = queue.shift();
+          const { sk } = thin(m0, bw.w, bw.h);
+          const lp = longestPath(sk, bw.w, bw.h);
+          if (lp && lp.len >= 2) {
+            const absPath = new Float64Array(lp.len * 2);
+            for (let i = 0; i < lp.len; i++) {
+              absPath[i * 2] = lp.pts[i * 2] + bw.x;
+              absPath[i * 2 + 1] = lp.pts[i * 2 + 1] + bw.y;
+            }
+            if (opts.localColor) {
+              emitLocal(absPath, lp.len, half, bw.m, bw.x, bw.y, bw.w, bw.h, -1, cIdx, -1, inkFallback);
+            } else {
+              const rib = ribbon(absPath, lp.len, half);
+              emitStroke(rib, rib.length / 2, absPath, lp.len, half, inkFallback, 1, cIdx, -1);
+            }
+            const cover = new Uint8Array(bw.w * bw.h);
+            fillPoly(cover, bw.w, bw.h, (() => {
+              const r = ribbon(absPath, lp.len, half);
+              const out = new Float64Array(r.length);
+              for (let i = 0; i < r.length; i += 2) { out[i] = r[i] - bw.x; out[i + 1] = r[i + 1] - bw.y; }
+              return out;
+            })());
+            for (let i = 0; i < m0.length; i++) if (m0[i] && cover[i]) m0[i] = 0;
+          }
+          // 剩下的连通块继续排队
+          const rc = compsOfLabels(m0, bw.w, bw.h);
+          for (let j = 0; j < rc.comps.length; j++) {
+            if (rc.comps[j].label !== 1 || rc.comps[j].count < Math.max(24, 3 * half * half)) continue;
+            const nm = new Uint8Array(bw.w * bw.h);
+            for (let k = 0; k < rc.comps[j].count; k++) nm[rc.pix[rc.comps[j].start + k]] = 1;
+            queue.push(nm);
+          }
+        }
+        inkClips.push(cIdx);
+      }
+    }
+    prog(0.55, '铺色块…'); await yieldUI();
+
+    // ---- 8b) 非线稿区块：毛笔刷（沿主轴来回档） ----
+    const regionOrder = [];
+    {
+      const bgGuess = (() => {
+        // 边角多数色 = 背景
+        let br = 0, bg = 0, bb = 0, cnt = 0;
+        const pts = [[0, 0], [W - 1, 0], [0, H - 1], [W - 1, H - 1], [W >> 1, 0], [0, H >> 1], [W - 1, H >> 1], [W >> 1, H - 1]];
+        for (const [x, y] of pts) { const p = y * W + x; br += R[p]; bg += G[p]; bb += B[p]; cnt++; }
+        return [br / cnt, bg / cnt, bb / cnt];
+      })();
+      const imp = (rg) => Math.hypot(rg.color[0] - 255, rg.color[1] - 255, rg.color[2] - 255);
+      const isBg = (rg) => luma(rg.color) > 240 && imp(rg) < 24;
+      for (let ri = 0; ri < regions.length; ri++) regionOrder.push(ri);
+      regionOrder.sort((a, b) => {
+        const A = regions[a], Bv = regions[b];
+        const ba = isBg(A) ? 0 : 1, bb2 = isBg(Bv) ? 0 : 1;
+        if (ba !== bb2) return ba - bb2;
+        const ia = imp(A), ib = imp(Bv);
+        if (Math.abs(ia - ib) > 1e-6) return ib - ia;
+        return Bv.area - A.area;
+      });
+      for (const ri of regionOrder) {
+        const rg = regions[ri];
+        if (isInk[ri]) continue;
+        const clip = regionMaskOf(compOf, W, rg.cid, rg.x0, rg.y0, rg.x1, rg.y1);
+        // 取色时把掩膜内缩 1px：避开边界上的混色像素，否则会被"拉亮"出亮边
+        const sampleM = rg.area > 600 ? erode(clip.m, clip.w, clip.h, 1) : clip.m;
+        const cIdx = pushClip(rg.x0, rg.y0, clip.w, clip.h, clip.m);
+        const bleedW = Math.round(opts.bleedFirst * strokeScale);
+        const cBleed = (opts.bleedFirst > 0 && bleedW > 0)
+          ? pushClip(rg.x0, rg.y0, clip.w, clip.h, dilate(clip.m, clip.w, clip.h, bleedW))
+          : cIdx;
+        const ext = rg.hp * 2;
+        let bwid = clamp(ext * 0.16, 9 * strokeScale, 46 * strokeScale);
+        let nP = Math.max(1, Math.ceil(ext / (bwid * 0.62)));   // 覆盖率 ≥ 62% 重叠
+        if (nP > 24) { nP = 24; bwid = Math.max(bwid, ext / (nP * 0.62)); }   // 档数封顶就加宽笔刷
+        const ax = rg.ax, ay = rg.ay;
+        const px2 = -ay, py2 = ax;
+        let k = 0;
+        for (let pi = 0; pi < nP; pi++) {
+          const v = -rg.hp + (pi + 0.5) * (ext / nP);
+          const wob = Math.min(2.6, bwid * 0.1) * Math.sin((pi * 1.7) % 6.28);
+          const t0 = rg.tmin - 3, t1 = rg.tmax + 3;
+          const nseg = 5;
+          const path = new Float64Array(nseg * 2);
+          for (let s = 0; s < nseg; s++) {
+            const tt = t0 + (t1 - t0) * s / (nseg - 1);
+            path[s * 2] = rg.cx + ax * tt + px2 * (v + wob);
+            path[s * 2 + 1] = rg.cy + ay * tt + py2 * (v + wob);
+          }
+          const useClip = (pi === 0) ? cBleed : cIdx;
+          if (opts.localColor) {
+            emitLocal(path, nseg, bwid / 2, sampleM, rg.x0, rg.y0, clip.w, clip.h, 0, useClip, ri, rg.color);
+          } else {
+            const rib = ribbon(path, nseg, bwid / 2);
+            emitStroke(rib, rib.length / 2, path, nseg, bwid / 2, rg.color, 0, useClip, ri);
+          }
+        }
+      }
+    }
+    prog(0.78, '补笔修形…'); await yieldUI();
+
+    dbg.mainStrokes = strokes.length;
+    // ---- 8c) 残差补笔：哪块不像就在哪块补细笔（按局部小块，允许覆盖） ----
+    if ((opts.residual && opts.residual.length) || opts.returnCanvas || opts.returnKeys) {
+      const canvas = new Uint8Array(N * 3);
+      canvas.fill(255);
+      const raster = (ribArr, color, clipIdx) => {
+        const cl = clips[clipIdx];
+        let xmin = Infinity, ymin = Infinity, xmax = -Infinity, ymax = -Infinity;
+        for (let i = 0; i + 1 < ribArr.length; i += 2) {
+          const x = ribArr[i], y = ribArr[i + 1];
+          if (x < xmin) xmin = x; if (x > xmax) xmax = x;
+          if (y < ymin) ymin = y; if (y > ymax) ymax = y;
+        }
+        xmin = Math.max(cl.x, Math.floor(xmin)); ymin = Math.max(cl.y, Math.floor(ymin));
+        xmax = Math.min(cl.x + cl.w - 1, Math.ceil(xmax)); ymax = Math.min(cl.y + cl.h - 1, Math.ceil(ymax));
+        if (xmax < xmin || ymax < ymin) return;
+        const mw = xmax - xmin + 1, mh = ymax - ymin + 1;
+        const local = new Uint8Array(mw * mh);
+        const np2 = ribArr.length >> 1;
+        const pts = new Float64Array(np2 * 2);
+        for (let i = 0; i < np2; i++) { pts[i * 2] = ribArr[i * 2] - xmin; pts[i * 2 + 1] = ribArr[i * 2 + 1] - ymin; }
+        fillPoly(local, mw, mh, pts);
+        const soft = feather(local, mw, mh);
+        for (let y = 0; y < mh; y++) {
+          const yy = ymin + y;
+          const rowC = (yy - cl.y) * cl.w;
+          for (let x = 0; x < mw; x++) {
+            const al = soft[y * mw + x];
+            if (al <= 0) continue;
+            const xx = xmin + x;
+            if (!cl.mask[rowC + (xx - cl.x)]) continue;
+            const pp = yy * W + xx;
+            if (al >= 0.995) {
+              canvas[pp * 3] = color[0]; canvas[pp * 3 + 1] = color[1]; canvas[pp * 3 + 2] = color[2];
+            } else {
+              canvas[pp * 3] = canvas[pp * 3] * (1 - al) + color[0] * al;
+              canvas[pp * 3 + 1] = canvas[pp * 3 + 1] * (1 - al) + color[1] * al;
+              canvas[pp * 3 + 2] = canvas[pp * 3 + 2] * (1 - al) + color[2] * al;
+            }
+          }
+        }
+      };
+      // 关键帧：主笔过程中每 1/K 张快照，方便网页端拖动进度（当然也在跑完时快照一张）
+      const keysOut = [];
+      const kEvery = Math.max(1, Math.ceil(strokes.length / (opts.keyFrames || 5)));
+      for (let i0 = 0; i0 < strokes.length; i0++) {
+        const st0 = strokes[i0];
+        raster(st0.rib, st0.color, st0.c);
+        if ((i0 + 1) % kEvery === 0) keysOut.push({ i: i0 + 1, rgb: canvas.slice() });
+      }
+      if (!keysOut.length || keysOut[keysOut.length - 1].i !== strokes.length) {
+        keysOut.push({ i: strokes.length, rgb: canvas.slice() });
+      }
+      const emitRaster = (rib, pathPts, nPath, halfW, col, pen, cIdx) => {
+        const rec = emitStroke(rib, rib.length / 2, pathPts, nPath, halfW, col, pen, cIdx, -1);
+        raster(rec.rib, rec.color, rec.c);
+        return rec;
+      };
+      const TILE = 72;
+      let prevPct = 999;
+      for (let round = 0; round < opts.residual.length; round++) {
+        if (strokes.length > opts.maxStrokes) break;
+        const thr = opts.residual[round];
+        let added = 0;
+        // 全图错误掩膜：把"又大又厚"的错误块（大片平滑渐变差异）排除在补笔之外，
+        // 否则会按 72px 小格补出块状拼贴
+        const skip = new Uint8Array(N);
+        {
+          const wrongAll = new Uint8Array(N);
+          for (let i2 = 0; i2 < N; i2++) {
+            const d2 = Math.max(Math.abs(canvas[i2 * 3] - R[i2]),
+                                Math.abs(canvas[i2 * 3 + 1] - G[i2]),
+                                Math.abs(canvas[i2 * 3 + 2] - B[i2]));
+            if (d2 > thr) wrongAll[i2] = 1;
+          }
+          const wcc = compsOfLabels(wrongAll, W, H);
+          for (let ci = 0; ci < wcc.comps.length; ci++) {
+            const c = wcc.comps[ci];
+            if (c.label !== 1) continue;
+            const bw2 = c.x1 - c.x0 + 1, bh2 = c.y1 - c.y0 + 1;
+            const thick = c.count / Math.max(1, Math.max(bw2, bh2));
+            if (c.count > 2500 && thick > opts.resThick * strokeScale) {
+              for (let k = 0; k < c.count; k++) skip[wcc.pix[c.start + k]] = 1;
+            }
+          }
+        }
+        for (let ty = 0; ty < H && added < 6000; ty += TILE) {
+          for (let tx = 0; tx < W && added < 6000; tx += TILE) {
+            const tw = Math.min(TILE, W - tx), th = Math.min(TILE, H - ty);
+            const wrong = new Uint8Array(tw * th);
+            let any = 0;
+            for (let y = 0; y < th; y++) {
+              for (let x = 0; x < tw; x++) {
+                const pp = (ty + y) * W + (tx + x);
+                const d = Math.max(Math.abs(canvas[pp * 3] - R[pp]),
+                                   Math.abs(canvas[pp * 3 + 1] - G[pp]),
+                                   Math.abs(canvas[pp * 3 + 2] - B[pp]));
+                if (d > thr && !skip[pp]) { wrong[y * tw + x] = 1; any++; }
+              }
+            }
+            if (any < 5) continue;
+            const cc = compsOfLabels(wrong, tw, th);
+            const toX = (lp) => tx + (lp % tw);
+            const toY = (lp) => ty + ((lp / tw) | 0);
+            for (let ci = 0; ci < cc.comps.length; ci++) {
+              const c = cc.comps[ci];
+              if (c.label !== 1 || c.count < 5) continue;
+              // 按颜色分裂（方差最大通道二分，最多 3 层）
+              const parts = [];
+              (function split(st, cnt, depth) {
+                if (depth >= 4 || cnt < 9) { parts.push([st, cnt]); return; }
+                let mn0 = 255, mn1 = 255, mn2 = 255, mx0 = 0, mx1 = 0, mx2 = 0;
+                for (let k = 0; k < cnt; k++) {
+                  const pp = toY(cc.pix[st + k]) * W + toX(cc.pix[st + k]);
+                  if (R[pp] < mn0) mn0 = R[pp]; if (R[pp] > mx0) mx0 = R[pp];
+                  if (G[pp] < mn1) mn1 = G[pp]; if (G[pp] > mx1) mx1 = G[pp];
+                  if (B[pp] < mn2) mn2 = B[pp]; if (B[pp] > mx2) mx2 = B[pp];
+                }
+                const s0 = mx0 - mn0, s1 = mx1 - mn1, s2 = mx2 - mn2;
+                const smax = Math.max(s0, s1, s2);
+                if (smax <= 18) { parts.push([st, cnt]); return; }
+                const ch = s0 === smax ? 0 : (s1 === smax ? 1 : 2);
+                const vals = new Float64Array(cnt);
+                for (let k = 0; k < cnt; k++) {
+                  const pp = toY(cc.pix[st + k]) * W + toX(cc.pix[st + k]);
+                  vals[k] = ch === 0 ? R[pp] : (ch === 1 ? G[pp] : B[pp]);
+                }
+                const sorted = Array.from(vals).sort((a, b) => a - b);
+                const med = sorted[cnt >> 1];
+                let i = 0, j = cnt - 1;
+                while (i <= j) {
+                  if (vals[i] <= med) i++;
+                  else {
+                    const ti = cc.pix[st + i]; cc.pix[st + i] = cc.pix[st + j]; cc.pix[st + j] = ti;
+                    const tv = vals[i]; vals[i] = vals[j]; vals[j] = tv; j--;
+                  }
+                }
+                if (i === 0 || i === cnt) { parts.push([st, cnt]); return; }
+                split(st, i, depth + 1);
+                split(st + i, cnt - i, depth + 1);
+              })(c.start, c.count, 0);
+
+              // 颜色分裂后的每一份再按连通切开（避免"散点连成一条长笔"）
+              const pieces = [];
+              for (const part of parts) {
+                const st = part[0], cnt = part[1];
+                if (cnt < 5) continue;
+                const pm = new Uint8Array(tw * th);
+                for (let k = 0; k < cnt; k++) pm[cc.pix[st + k]] = 1;
+                const pc = compsOfLabels(pm, tw, th);
+                for (let j = 0; j < pc.comps.length; j++) {
+                  if (pc.comps[j].label === 1 && pc.comps[j].count >= 5) {
+                    pieces.push([pc, j]);
+                  }
+                }
+              }
+              for (const piece of pieces) {
+                const pcc = piece[0], ci2 = piece[1];
+                const st = pcc.comps[ci2].start, cnt = pcc.comps[ci2].count;
+                if (cnt < 5) continue;
+                let cr = 0, cg = 0, cb = 0;
+                let x0 = W, y0 = H, x1 = -1, y1 = -1;
+                for (let k = 0; k < cnt; k++) {
+                  const xx = toX(pcc.pix[st + k]), yy = toY(pcc.pix[st + k]);
+                  const pp = yy * W + xx;
+                  cr += R[pp]; cg += G[pp]; cb += B[pp];
+                  if (xx < x0) x0 = xx; if (xx > x1) x1 = xx;
+                  if (yy < y0) y0 = yy; if (yy > y1) y1 = yy;
+                }
+                const col = [Math.round(cr / cnt), Math.round(cg / cnt), Math.round(cb / cnt)];
+                const pad = 0;
+                const bx = Math.max(0, x0 - pad), by = Math.max(0, y0 - pad);
+                const bx1 = Math.min(W - 1, x1 + pad), by1 = Math.min(H - 1, y1 + pad);
+                const mw = bx1 - bx + 1, mh = by1 - by + 1;
+                const bin = new Uint8Array(mw * mh);
+                for (let k = 0; k < cnt; k++) {
+                  bin[(toY(pcc.pix[st + k]) - by) * mw + (toX(pcc.pix[st + k]) - bx)] = 1;
+                }
+                const clipMask = dilate(bin, mw, mh, pad);
+                const cIdx = pushClip(bx, by, mw, mh, clipMask);
+                const cx0 = (x0 + x1) / 2, cy0 = (y0 + y1) / 2;
+                if (cnt <= 16) {                       // 小点：一笔点掉
+                  const rad = clamp(Math.sqrt(cnt / Math.PI) + 1.4, 2.0, 12);
+                  const poly = [];
+                  for (let k = 0; k < 13; k++) {
+                    const a = k / 13 * Math.PI * 2;
+                    poly.push(cx0 + rad * Math.cos(a), cy0 + rad * Math.sin(a));
+                  }
+                  emitRaster(poly, [cx0, cy0], 1, rad, col, 0, cIdx);
+                  added++;
+                  continue;
+                }
+                const dt = distanceTransform(bin, mw, mh);
+                const dvals = Array.from(dt).sort((a, b) => a - b);
+                const dmed = dvals[dvals.length >> 1];
+                const half = clamp(dmed * opts.resHalfA + opts.resHalfB, opts.resMin * strokeScale, 8 * strokeScale);
+                const sk2 = thin(bin, mw, mh).sk;
+                const lp = longestPath(sk2, mw, mh);
+                if (lp && lp.len >= 2) {
+                  const absPath = new Float64Array(lp.len * 2);
+                  for (let i = 0; i < lp.len; i++) {
+                    absPath[i * 2] = lp.pts[i * 2] + bx;
+                    absPath[i * 2 + 1] = lp.pts[i * 2 + 1] + by;
+                  }
+                  {
+                    const segs = pathSegments(absPath, lp.len, Math.max(18, half * 3.2));
+                    const cols = [];
+                    for (const sg of segs) {
+                      if (sg.n < 2) { cols.push(null); continue; }
+                      cols.push(sampleColor(ribbon(sg.pts, sg.n, half), sg.pts.length, bin, bx, by, mw, mh) || col);
+                    }
+                    let i2 = 0;
+                    while (i2 < segs.length) {
+                      let j2 = i2;
+                      while (j2 + 1 < segs.length && cols[j2 + 1] && cols[i2] &&
+                             Math.abs(cols[j2 + 1][0] - cols[i2][0]) +
+                             Math.abs(cols[j2 + 1][1] - cols[i2][1]) +
+                             Math.abs(cols[j2 + 1][2] - cols[i2][2]) < 42) j2++;
+                      const pts2 = [];
+                      for (let k2 = i2; k2 <= j2; k2++) {
+                        const P2 = segs[k2].pts;
+                        for (let m2 = 0; m2 < P2.length; m2++) pts2.push(P2[m2]);
+                      }
+                      const arr2 = Float64Array.from(pts2);
+                      if (arr2.length >= 4) {
+                        const rb = ribbon(arr2, arr2.length / 2, half);
+                        emitRaster(rb, arr2, arr2.length / 2, half, cols[i2] || col, 0, cIdx);
+                        added++;
+                      }
+                      i2 = j2 + 1;
+                    }
+                  }
+                } else {
+                  const rad = clamp(Math.sqrt(cnt / Math.PI) + 0.8, 2.0, 10);
+                  const poly = [];
+                  for (let k = 0; k < 13; k++) {
+                    const a = k / 13 * Math.PI * 2;
+                    poly.push(cx0 + rad * Math.cos(a), cy0 + rad * Math.sin(a));
+                  }
+                  emitRaster(poly, [cx0, cy0], 1, rad, col, 0, cIdx);
+                  added++;
+                }
+              }
+            }
+          }
+        }
+        let bad = 0;
+        for (let i = 0; i < N; i++) {
+          const d = Math.max(Math.abs(canvas[i * 3] - R[i]), Math.abs(canvas[i * 3 + 1] - G[i]), Math.abs(canvas[i * 3 + 2] - B[i]));
+          if (d > 8) bad++;
+        }
+        const pct = bad / N * 100;
+        prog(0.78 + 0.2 * (round + 1) / opts.residual.length,
+             "补笔修形… 第 " + (round + 1) + " 轮（可见差异 " + pct.toFixed(2) + "%）");
+        if (pct < 1.0) break;
+        if (opts.resStop > 0 && prevPct - pct < opts.resStop && round >= 1) break;   // 收益变小就收手
+        prevPct = pct;
+        await yieldUI();
+      }
+      keysOut.push({ i: strokes.length, rgb: canvas.slice() });
+      visCanvas = canvas;
+      keysRgb = keysOut;
+    }
+
+    // 时长归一：回放总时长按 targetSec 分配，单笔不低于 28ms
+    {
+      let tot = 0;
+      for (const st1 of strokes) tot += st1.ms;
+      const k = tot > 0 ? (opts.targetSec * 1000) / tot : 1;
+      for (const st1 of strokes) st1.ms = Math.round(Math.max(14, st1.ms * k) * 10) / 10;
+    }
+    prog(1.0, '完成');
+    return {
+      W, H, strokes, clips,
+      canvasRgb: opts.returnCanvas ? visCanvas : undefined,
+      keys: opts.returnKeys ? keysRgb : undefined,
+      palette: opts.debug ? pal.map((c) => [Math.round(c[0]), Math.round(c[1]), Math.round(c[2])]) : undefined,
+      dbg: opts.debug ? dbg : undefined,
+      probe: opts.probe ? (() => {
+        const p0 = opts.probe.y * W + opts.probe.x;
+        const ci = compOf[p0];
+        const ri = regions.findIndex((r) => r.cid === ci);
+        const rg = regions[ri];
+        return rg ? { cid: ci, ri, area: rg.area, bbox: [rg.x0, rg.y0, rg.x1, rg.y1], hp: Math.round(rg.hp),
+                      color: rg.color, isLine: isInk[ri], strokesOfRegion: strokes.filter((st) => st.r === ri).length }
+                  : { cid: ci, missing: true };
+      })() : undefined,
+      stats: {
+        regions: regions.length,
+        inkGroups: inkClips.length,
+        strokes: strokes.length,
+        totalMs: strokes.reduce((a, s) => a + s.ms, 0),
+      },
+    };
+  }
+
+  root.ISP_PIPELINE = { run, CFG, _u: { ribbon, fillPoly, distanceTransform, thin, longestPath, compsOfLabels } };
+})(typeof self !== 'undefined' ? self : globalThis);

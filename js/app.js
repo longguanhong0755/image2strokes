@@ -1,0 +1,500 @@
+/* 主线程应用：上传 → 提炼（Worker 里跑管线）→ 逐笔回放 */
+'use strict';
+
+const MAXSIDE = 1024;
+const $ = (id) => document.getElementById(id);
+
+let W = 0, H = 0;                 // 画布尺寸
+let STROKES = [], CLIPS = [], STATS = null;
+let target = null;                // 目标图 ImageData（用于对比）
+let painted = null, mt = null;    // 已完成的画（离屏）、主画布上下文
+let tmpC = null, tmp = null;      // 单笔合成用的临时画布
+let idx = 0, acc = 0, playing = false, done = false, lastT = performance.now();
+let speed = 2, cursor = null, guide = null, showTip = true, showGuide = true;
+let clipCache = new Map(), lastClip = -1;
+let worker = null;
+let cumMs = null;              // 每笔的累计时长
+let keys = [];                 // 关键帧快照 {i, data} 或 {i, rgb}（管线侧光栅）
+let keyEvery = 0;
+let KEYFRAMES = [];
+
+// ---------------- 工具 ----------------
+const clamp = (v, a, b) => (v < a ? a : (v > b ? b : v));
+function hash01(a, b) {
+  const x = Math.sin(a * 127.1 + b * 311.7) * 43758.5453;
+  return x - Math.floor(x);
+}
+function ribbonPath(st) {
+  const p = new Path2D();
+  const r = st.rib;
+  p.moveTo(r[0], r[1]);
+  for (let i = 2; i < r.length; i += 2) p.lineTo(r[i], r[i + 1]);
+  p.closePath();
+  return p;
+}
+function tipAt(st, u) {
+  const tp = st.tp, n = tp.length / 2;
+  if (n < 2) return { x: tp[0], y: tp[1], dx: 1, dy: 0, single: true };
+  let total = 0;
+  for (let i = 1; i < n; i++) total += Math.hypot(tp[i * 2] - tp[(i - 1) * 2], tp[i * 2 + 1] - tp[(i - 1) * 2 + 1]);
+  const want = clamp(u, 0, 1) * total;
+  let run = 0;
+  for (let i = 1; i < n; i++) {
+    const ax = tp[(i - 1) * 2], ay = tp[(i - 1) * 2 + 1];
+    const bx = tp[i * 2], by = tp[i * 2 + 1];
+    const seg = Math.hypot(bx - ax, by - ay);
+    if (run + seg >= want || i === n - 1) {
+      const f = seg > 1e-6 ? (want - run) / seg : 1;
+      const x = ax + (bx - ax) * f, y = ay + (by - ay) * f;
+      const dx = bx - ax, dy = by - ay, ln = Math.hypot(dx, dy) || 1;
+      return { x, y, dx: dx / ln, dy: dy / ln, single: false };
+    }
+    run += seg;
+  }
+  return { x: tp[0], y: tp[1], dx: 1, dy: 0, single: false };
+}
+
+// ---------------- 上传与提炼 ----------------
+function fitImage(img) {
+  let w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+  const s = Math.min(1, MAXSIDE / Math.max(w, h));
+  w = Math.max(8, Math.round(w * s)); h = Math.max(8, Math.round(h * s));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const x = c.getContext('2d');
+  x.imageSmoothingEnabled = true; x.imageSmoothingQuality = 'high';
+  x.fillStyle = '#ffffff'; x.fillRect(0, 0, w, h);
+  x.drawImage(img, 0, 0, w, h);
+  return c;
+}
+
+function startExtract(imgCanvas) {
+  W = imgCanvas.width; H = imgCanvas.height;
+  const ctx2 = imgCanvas.getContext('2d');
+  target = ctx2.getImageData(0, 0, W, H);
+  $('stage').style.display = 'block';
+  $('canvasWrap').style.display = 'none';
+  $('welcome').style.display = 'none';
+  $('status').textContent = '正在提炼…';
+  $('bar').style.width = '0%';
+  const opts = {
+    colors: parseInt($('colors').value, 10),
+    targetSec: 240,
+  };
+  if (!worker) {
+    worker = new Worker('js/worker.js');
+    worker.onmessage = onWorker;
+    worker.onerror = (e) => { $('status').textContent = '出错：' + e.message; };
+  }
+  const copy = new Uint8ClampedArray(target.data);   // 原数据留着做对比
+  worker.postMessage({ px: copy.buffer, W, H, opts }, [copy.buffer]);
+}
+
+function onWorker(e) {
+  const d = e.data;
+  if (d.type === 'progress') {
+    $('bar').style.width = (d.p * 100).toFixed(0) + '%';
+    if (d.msg) $('status').textContent = d.msg;
+    return;
+  }
+  if (d.type === 'error') { $('status').textContent = '出错：' + d.msg; return; }
+  STROKES = d.res.strokes; CLIPS = d.res.clips; STATS = d.res.stats;
+  KEYFRAMES = (d.res.keys || []).map((k) => ({ i: k.i, rgb: k.rgb }));
+  buildCanvases();
+  resetPlayback();
+  $('stage').style.display = 'none';
+  $('canvasWrap').style.display = 'block';
+  $('stat').innerHTML = '共 <em>' + STATS.strokes + '</em> 笔 · 约 <em>' +
+    Math.round(STATS.totalMs / 1000) + '</em> 秒画完（1×）';
+  playing = true;
+  $('play').textContent = '暂停';
+}
+
+// ---------------- 画布 ----------------
+function buildCanvases() {
+  const main = $('cv');
+  main.width = W; main.height = H;
+  mt = main.getContext('2d');
+  painted = document.createElement('canvas');
+  painted.width = W; painted.height = H;
+  painted.getContext('2d').fillStyle = '#ffffff';
+  painted.getContext('2d').fillRect(0, 0, W, H);
+  tmpC = document.createElement('canvas');
+  tmpC.width = W; tmpC.height = H;
+  tmp = tmpC.getContext('2d');
+  clipCache = new Map(); lastClip = -1;
+  cumMs = new Float64Array(STROKES.length + 1);
+  for (let i = 0; i < STROKES.length; i++) cumMs[i + 1] = cumMs[i] + STROKES[i].ms;
+  keyEvery = Math.max(300, Math.ceil(STROKES.length / 8));
+  keys = [];
+  fitView();
+}
+
+function fitView() {
+  const wrap = $('canvasWrap');
+  const maxW = wrap.clientWidth - 8, maxH = window.innerHeight - 190;
+  const s = Math.min(maxW / W, maxH / H, 1);
+  const cv = $('cv');
+  cv.style.width = Math.round(W * s) + 'px';
+  cv.style.height = Math.round(H * s) + 'px';
+}
+window.addEventListener('resize', fitView);
+
+function clipCanvasFor(c) {
+  if (clipCache.has(c)) return clipCache.get(c);
+  const cl = CLIPS[c];
+  const cv = document.createElement('canvas');
+  cv.width = cl.w; cv.height = cl.h;
+  const x = cv.getContext('2d');
+  const id = x.createImageData(cl.w, cl.h);
+  const m = cl.mask;
+  for (let i = 0; i < m.length; i++) {
+    id.data[i * 4] = 255; id.data[i * 4 + 1] = 255; id.data[i * 4 + 2] = 255;
+    id.data[i * 4 + 3] = m[i] ? 255 : 0;
+  }
+  x.putImageData(id, 0, 0);
+  if (clipCache.size > 40) {                       // 简单的容量控制
+    const first = clipCache.keys().next().value;
+    clipCache.delete(first);
+  }
+  clipCache.set(c, cv);
+  return cv;
+}
+
+// 画一笔（u=1 为整笔）。u<1 时只把"半成品"放进临时画布，不落到成品
+let pending = -1, pendRect = null;
+function paintStroke(i, u) {
+  const st = STROKES[i];
+  const cl = CLIPS[st.c];
+  const t = tipAt(st, u);
+  cursor = { x: t.x, y: t.y, r: Math.max(2.5, st.w * 0.5), pen: st.pen, color: st.color };
+  guide = st.tp;
+  const rgb = 'rgb(' + st.color[0] + ',' + st.color[1] + ',' + st.color[2] + ')';
+  const rect = { x: cl.x, y: cl.y, w: cl.w, h: cl.h };
+  tmp.setTransform(1, 0, 0, 1, 0, 0);
+  tmp.clearRect(rect.x, rect.y, rect.w, rect.h);
+  tmp.save();
+  tmp.fillStyle = rgb;
+  if (u >= 1) {
+    tmp.fill(ribbonPath(st));                       // 整笔：笔形
+  } else {
+    tmp.clip(ribbonPath(st));                       // 半成品：笔形 ∩ 已扫过的部分
+    tmp.clip(leadPath(t, st));
+    tmp.fillRect(rect.x, rect.y, rect.w, rect.h);
+    tmp.restore();
+    tmp.save();                                     // 笔尖前方的湿边（半透明）
+    tmp.clip(ribbonPath(st));
+    const nx = -t.dy, ny = t.dx, spread = Math.max(4, st.w * 1.3);
+    const fwd = st.pen ? 0 : Math.max(2, st.w * 0.9);
+    const wet = new Path2D();
+    wet.moveTo(t.x + nx * spread, t.y + ny * spread);
+    wet.lineTo(t.x + t.dx * fwd + nx * spread, t.y + t.dy * fwd + ny * spread);
+    wet.lineTo(t.x + t.dx * fwd - nx * spread, t.y + t.dy * fwd - ny * spread);
+    wet.lineTo(t.x - nx * spread, t.y - ny * spread);
+    wet.closePath();
+    tmp.fillStyle = rgb;
+    tmp.globalAlpha = 0.42;
+    tmp.fill(wet);
+  }
+  tmp.restore();
+  tmp.globalCompositeOperation = 'destination-in';  // 用遮罩裁形
+  tmp.drawImage(clipCanvasFor(st.c), rect.x, rect.y);
+  tmp.globalCompositeOperation = 'source-over';
+  const ctx = painted.getContext('2d');
+  ctx.drawImage(tmpC, rect.x, rect.y, rect.w, rect.h, rect.x, rect.y, rect.w, rect.h);
+  if (u >= 1) { pending = -1; pendRect = null; return true; }
+  pending = i; pendRect = rect;
+  return false;
+}
+
+// 笔尖前沿：以笔尖为中心、往后拉一块"已扫过"的多边形
+function leadPath(t, st) {
+  const behind = st.pen ? 0 : Math.max(2, st.w * 0.45);
+  const spread = Math.max(4, st.w * 1.3);
+  const seed = st.ms * 7 + st.tp.length;
+  const p = new Path2D();
+  const nx = -t.dy, ny = t.dx;
+  const back = 4000;
+  p.moveTo(t.x - t.dx * back + nx * spread, t.y - t.dy * back + ny * spread);
+  for (let k = 1; k <= 12; k++) {                     // 锯齿状前沿
+    const f = k / 12;
+    const j = (hash01(seed, k) - 0.5) * spread * 0.55;
+    const along = -behind * f;
+    p.lineTo(t.x + t.dx * along + nx * (spread + j), t.y + t.dy * along + ny * (spread + j));
+  }
+  for (let k = 12; k >= 1; k--) {
+    const f = k / 12;
+    const j = (hash01(seed + 3, k) - 0.5) * spread * 0.55;
+    const along = -behind * f;
+    p.lineTo(t.x + t.dx * along - nx * (spread + j), t.y + t.dy * along - ny * (spread + j));
+  }
+  p.closePath();
+  return p;
+}
+
+// ---------------- 播放循环 ----------------
+function flushMain() {
+  mt.setTransform(1, 0, 0, 1, 0, 0);
+  mt.fillStyle = '#ffffff';
+  mt.fillRect(0, 0, W, H);
+  if ($('cmp').checked && target) {
+    mt.putImageData(target, 0, 0);
+    return;
+  }
+  mt.drawImage(painted, 0, 0);
+  if (pending >= 0 && !done && pendRect) {               // 半成品浮在成品之上
+    mt.drawImage(tmpC, pendRect.x, pendRect.y, pendRect.w, pendRect.h,
+                 pendRect.x, pendRect.y, pendRect.w, pendRect.h);
+  }
+  if (cursor && showTip && !done) drawCursor(mt, cursor);
+  if (guide && showGuide && !done) drawGuide(mt, guide, cursor);
+}
+
+function drawCursor(ctx, c) {
+  ctx.save();
+  ctx.translate(c.x, c.y);
+  if (c.pen) {
+    ctx.fillStyle = 'rgba(30,30,36,0.92)';
+    ctx.beginPath();
+    ctx.arc(0, 0, Math.max(2.2, c.r * 0.5), 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    ctx.strokeStyle = 'rgba(40,40,48,0.75)';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.arc(0, 0, c.r * 1.15, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = 'rgba(' + c.color[0] + ',' + c.color[1] + ',' + c.color[2] + ',0.85)';
+    ctx.beginPath(); ctx.arc(0, 0, Math.max(2, c.r * 0.55), 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawGuide(ctx, tp, c) {
+  if (!c) return;
+  ctx.save();
+  ctx.setLineDash([6, 6]);
+  ctx.strokeStyle = 'rgba(60,60,70,0.32)';
+  ctx.lineWidth = Math.max(1, W / 1024);
+  ctx.beginPath();
+  ctx.moveTo(tp[0], tp[1]);
+  for (let i = 2; i < tp.length; i += 2) ctx.lineTo(tp[i], tp[i + 1]);
+  ctx.stroke();
+  ctx.restore();
+}
+
+let lastTickAt = 0;
+function tick() {
+  const now = performance.now();
+  lastTickAt = now;
+  const dt = Math.min(100, now - lastT); lastT = now;
+  if (playing && !done) {
+    acc += dt * speed;
+    let guard = 0;
+    while (idx < STROKES.length && acc >= STROKES[idx].ms && guard++ < 400) {
+      acc -= STROKES[idx].ms;
+      paintStroke(idx, 1);
+      idx++;
+      if (keyEvery && idx % keyEvery === 0 && idx < STROKES.length) snapshotKey(idx);
+      if (idx >= STROKES.length) { finish(); break; }
+    }
+  }
+  flushMain();
+  hud();
+  schedule();
+}
+
+// 页面在后台时 rAF 不触发：退回定时器，保证"离开标签页也会继续画"
+function schedule() {
+  if (document.hidden) setTimeout(tick, 100);
+  else requestAnimationFrame(tick);
+}
+// 看门狗：窗口未聚焦时 rAF 可能被节流甚至暂停，这里保证动画继续推进
+setInterval(function () {
+  if (performance.now() - lastTickAt > 50) tick();
+}, 50);
+
+function restoreKey(k, ctx) {
+  if (k.data) { ctx.putImageData(k.data, 0, 0); return; }
+  const W2 = W, H2 = H;
+  if (!restoreKey.buf || restoreKey.buf.width !== W2 || restoreKey.buf.height !== H2) {
+    restoreKey.buf = ctx.createImageData(W2, H2);
+    const dd = restoreKey.buf.data;
+    for (let i = 3; i < dd.length; i += 4) dd[i] = 255;
+  }
+  const img = restoreKey.buf, dd = img.data, rgb = k.rgb;
+  for (let i = 0, j = 0; i < rgb.length; i += 3, j += 4) {
+    dd[j] = rgb[i]; dd[j + 1] = rgb[i + 1]; dd[j + 2] = rgb[i + 2];
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+function allKeys() { return KEYFRAMES.concat(keys).sort((a, b) => a.i - b.i); }
+
+function snapshotKey(i) {
+  try {
+    keys.push({ i, data: painted.getContext('2d').getImageData(0, 0, W, H) });
+  } catch (e) { /* 忽略：内存不足就放弃关键帧 */ }
+}
+
+function hud() {
+  if (!STATS) return;
+  const p = done ? 1 : (idx + (STROKES[idx] ? clamp(acc / STROKES[idx].ms, 0, 1) : 0)) / STROKES.length;
+  $('fill').style.width = (p * 100).toFixed(2) + '%';
+  const t = done ? STATS.totalMs : (function () {
+    let s = 0;
+    for (let i = 0; i < idx; i++) s += STROKES[i].ms;
+    return s + acc;
+  })();
+  $('clock').textContent = fmt(t / 1000) + ' / ' + fmt(STATS.totalMs / 1000);
+  if (!done) $('stat').innerHTML = '第 <em>' + Math.min(idx + 1, STROKES.length) + '</em> / ' +
+    STROKES.length + ' 笔 · ' + (p * 100).toFixed(0) + '%';
+}
+
+function fmt(s) {
+  s = Math.max(0, Math.round(s));
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+function resetPlayback() {
+  idx = 0; acc = 0; done = false; cursor = null; guide = null;
+  pending = -1; pendRect = null;
+  const ctx = painted.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, W, H);
+  keys = [];
+  playing = true;
+  $('play').textContent = '暂停';
+  $('stat').textContent = '准备开始…';
+}
+
+function jumpTo(sec) {
+  const tgt = sec * 1000;
+  const cur = done ? cumMs[STROKES.length] : (cumMs[idx] + acc);
+  // 向前小步：直接在当前画面上续画，不用重来
+  if (tgt >= cur - 50 && tgt - cur < 45000 && !done) {
+    advanceTo(tgt);
+    return;
+  }
+  const ctx = painted.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  let ci = 0;
+  while (ci < STROKES.length && cumMs[ci + 1] <= tgt) ci++;
+  let k = null;
+  for (const kk of allKeys()) { if (kk.i <= ci) k = kk; else break; }
+  if (k) restoreKey(k, ctx);
+  else { ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, W, H); }
+  done = false;
+  idx = k ? k.i : 0;
+  acc = 0;
+  advanceTo(tgt);
+}
+
+function advanceTo(tgt) {
+  while (idx < STROKES.length && cumMs[idx + 1] <= tgt) {
+    paintStroke(idx, 1);
+    idx++;
+    if (keyEvery && idx % keyEvery === 0 && idx < STROKES.length) snapshotKey(idx);
+  }
+  if (idx >= STROKES.length) { finish(); return; }
+  acc = Math.max(0, tgt - cumMs[idx]);
+  paintStroke(idx, clamp(acc / STROKES[idx].ms, 0, 1));
+}
+
+// ---------------- 收尾与差异 ----------------
+function diffVsTarget() {
+  const a = painted.getContext('2d').getImageData(0, 0, W, H).data;
+  const b = target.data;
+  let sum = 0, bad = 0;
+  const tot = W * H * 3;
+  for (let i = 0; i < a.length; i += 4) {
+    for (let k = 0; k < 3; k++) {
+      const d = Math.abs(a[i + k] - b[i + k]);
+      if (d > 8) bad++;
+      sum += d;
+    }
+  }
+  // 整体差异：缩到 1/4 再看一次（忽略逐像素的颗粒/锯齿，更接近肉眼判断）
+  const s = 4, w2 = Math.max(1, Math.round(W / s)), h2 = Math.max(1, Math.round(H / s));
+  const c1 = document.createElement('canvas'); c1.width = w2; c1.height = h2;
+  const c2 = document.createElement('canvas'); c2.width = w2; c2.height = h2;
+  const x1 = c1.getContext('2d'), x2 = c2.getContext('2d');
+  const tc = document.createElement('canvas'); tc.width = W; tc.height = H;
+  tc.getContext('2d').putImageData(target, 0, 0);
+  x1.drawImage(painted, 0, 0, w2, h2);
+  x2.drawImage(tc, 0, 0, w2, h2);
+  const d1 = x1.getImageData(0, 0, w2, h2).data, d2 = x2.getImageData(0, 0, w2, h2).data;
+  let s2 = 0, b2 = 0;
+  const t2 = w2 * h2 * 3;
+  for (let i = 0; i < d1.length; i += 4) {
+    for (let k = 0; k < 3; k++) {
+      const d = Math.abs(d1[i + k] - d2[i + k]);
+      if (d > 8) b2++;
+      s2 += d;
+    }
+  }
+  return { mean: sum / tot, badPct: bad / tot * 100, mean4: s2 / t2, bad4: b2 / t2 * 100 };
+}
+
+function finish() {
+  done = true; playing = false; cursor = null; guide = null;
+  $('play').textContent = '重播';
+  const d = diffVsTarget();
+  $('stat').innerHTML = '画完了 · <em>' + STROKES.length + '</em> 笔 · 整体差异（1/4 缩放）平均 <em>' +
+    d.mean4.toFixed(2) + '/255</em>、可见差异 <em>' + d.bad4.toFixed(2) + '%</em>' +
+    ' · 逐像素细节差异平均 ' + d.mean.toFixed(2) + '、可见 ' + d.badPct.toFixed(2) + '%';
+}
+
+// ---------------- 交互 ----------------
+function bindUI() {
+  $('file').addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (f) loadFile(f);
+  });
+  const dz = $('drop');
+  ['dragenter', 'dragover'].forEach((k) => dz.addEventListener(k, (e) => { e.preventDefault(); dz.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach((k) => dz.addEventListener(k, (e) => { e.preventDefault(); dz.classList.remove('over'); }));
+  dz.addEventListener('drop', (e) => {
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) loadFile(f);
+  });
+  document.querySelectorAll('[data-sample]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const im = new Image();
+      im.crossOrigin = 'anonymous';
+      im.onload = () => startExtract(fitImage(im));
+      im.onerror = () => { $('status').textContent = '示例图加载失败'; };
+      im.src = el.getAttribute('data-sample');
+    });
+  });
+  $('play').addEventListener('click', () => {
+    if (done) { resetPlayback(); return; }
+    playing = !playing;
+    $('play').textContent = playing ? '暂停' : '继续';
+  });
+  $('speed').addEventListener('input', (e) => {
+    speed = parseFloat(e.target.value);
+    $('speedVal').textContent = speed.toFixed(2).replace(/0$/, '') + '×';
+  });
+  $('seek').addEventListener('input', (e) => {
+    if (!STROKES.length) return;
+    playing = false;
+    $('play').textContent = '继续';
+    jumpTo(parseFloat(e.target.value) / 1000 * (STATS.totalMs / 1000));
+  });
+  $('cmp').addEventListener('change', () => {});
+  $('tip').addEventListener('change', (e) => { showTip = e.target.checked; });
+  $('guideChk').addEventListener('change', (e) => { showGuide = e.target.checked; });
+  document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' && STROKES.length) { e.preventDefault(); $('play').click(); }
+  });
+}
+
+function loadFile(f) {
+  const url = URL.createObjectURL(f);
+  const im = new Image();
+  im.onload = () => { startExtract(fitImage(im)); URL.revokeObjectURL(url); };
+  im.onerror = () => { $('status').textContent = '图片读取失败'; URL.revokeObjectURL(url); };
+  im.src = url;
+}
+
+bindUI();
+schedule();
