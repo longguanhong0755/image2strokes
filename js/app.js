@@ -83,9 +83,12 @@ function startExtract(imgCanvas) {
   $('welcome').style.display = 'none';
   $('status').textContent = '正在提炼…';
   $('bar').style.width = '0%';
+  const detail = parseInt($('detail').value, 10);
   const opts = {
-    colors: parseInt($('colors').value, 10),
-    targetSec: 240,
+    colors: parseInt($('colors').value, 10) || 0,     // 0 = 自动（按纹理强度定）
+    style: $('style').value,
+    detail,
+    targetSec: detail === 0 ? 120 : (detail === 2 ? 480 : 240),
   };
   targetMs = opts.targetSec * 1000;
   if (!worker) {
@@ -112,7 +115,10 @@ function onWorker(e) {
   $('stage').style.display = 'none';
   $('canvasWrap').style.display = 'block';
   $('stat').innerHTML = '共 <em>' + STATS.strokes + '</em> 笔 · 约 <em>' +
-    Math.round(STATS.totalMs / 1000) + '</em> 秒画完（1×）· 起稿 → 铺色 → 收形 → 点睛';
+    Math.round(STATS.totalMs / 1000) + '</em> 秒画完（1×）· 起稿 → 铺色 → 收形 → 点睛' +
+    (STATS.photo ? ' · 已按照片自动用 <em>' + STATS.colors + '</em> 色' : (STATS.colors ? ' · ' + STATS.colors + ' 色' : ''));
+  for (const id of ['expVideo', 'expJson', 'expPng']) { const b = $(id); if (b) b.disabled = false; }
+  $('expMsg').textContent = '';
   playing = true;
   $('play').textContent = '暂停';
 }
@@ -568,6 +574,137 @@ function finish() {
     ' · 逐像素细节差异平均 ' + d.mean.toFixed(2) + '、可见 ' + d.badPct.toFixed(2) + '%';
 }
 
+// ---------------- 导出 ----------------
+function download(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+function stamp() {
+  const d = new Date(), p = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+}
+
+// 成品图
+function exportPng() {
+  if (!STROKES.length) return;
+  painted.toBlob((b) => {
+    download(b, 'image2strokes-' + stamp() + '.png');
+    $('expMsg').textContent = '成品图已导出（' + W + '×' + H + '）';
+  }, 'image/png');
+}
+
+// 视频：把整段过程在 ~24 秒里重画一遍，用 MediaRecorder 录成 WebM。
+// 推进由"真实时间"驱动（而不是靠每帧增量），所以即使标签页被节流
+//（rAF 不触发、定时器降到 1Hz），成片的长度和进度也还是对的。
+async function exportVideo() {
+  if (!STROKES.length) return;
+  const cv = $('cv');
+  if (typeof MediaRecorder === 'undefined' || !cv.captureStream) {
+    $('expMsg').textContent = '这个浏览器不支持录制，换 Chrome / Edge 试试';
+    return;
+  }
+  const btn = $('expVideo'), oldTxt = btn.textContent;
+  btn.disabled = true; btn.textContent = '录制中…';
+  $('expMsg').textContent = '正在快放录制（画面会自动重画一遍）…';
+  const OUT_SEC = 24;
+  const oldTip = showTip, oldGuide = showGuide, wasPlaying = playing;
+  const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
+    .find((m) => MediaRecorder.isTypeSupported(m)) || '';
+  const rec = new MediaRecorder(cv.captureStream(30), mime ? { mimeType: mime, videoBitsPerSecond: 8000000 } : undefined);
+  const chunks = [];
+  rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  const stopped = new Promise((r) => { rec.onstop = () => r(); });
+  const nextFrame = () => new Promise((r) => {
+    let fired = false;
+    const fin = () => { if (!fired) { fired = true; r(); } };
+    const h = setTimeout(fin, 500);        // rAF 被节流时的兜底
+    requestAnimationFrame(() => { clearTimeout(h); fin(); });
+  });
+  try {
+    showTip = false; showGuide = false;     // 录进去的画面不带笔尖和参考线
+    resetPlayback();
+    playing = false;                        // 由下面的循环推进，不走 tick
+    const total = STATS.totalMs;
+    const rate = total / (OUT_SEC * 1000);  // 每毫秒真实时间推进多少毫秒的"画"
+    rec.start();
+    const t0 = performance.now();
+    for (;;) {
+      const simT = Math.min(total, (performance.now() - t0) * rate);
+      while (idx < STROKES.length && cumMs[idx + 1] <= simT) {
+        paintStroke(idx, 1); idx++;
+        if ((idx & 511) === 0) $('expMsg').textContent = '录制中… ' + idx + ' / ' + STROKES.length + ' 笔';
+      }
+      if (idx >= STROKES.length) break;
+      const tStart = cumMs[idx] + travels[idx] + beats[idx];
+      if (simT > tStart) paintStroke(idx, clamp((simT - tStart) / msPaint[idx], 0, 1));
+      flushMain();
+      await nextFrame();
+      if (performance.now() - t0 > OUT_SEC * 4000) {
+        // 机器太慢时别再拖：剩下的笔一次补完，保证成品完整（视频会早一点结束）
+        while (idx < STROKES.length) { paintStroke(idx, 1); idx++; }
+        break;
+      }
+    }
+    flushMain();
+    await new Promise((r) => setTimeout(r, 600));              // 让最后一帧落进流里
+  } finally {
+    if (rec.state !== 'inactive') rec.stop();
+    await stopped;
+    showTip = oldTip; showGuide = oldGuide; playing = wasPlaying;
+    $('tip').checked = oldTip; $('guideChk').checked = oldGuide;
+    btn.disabled = false; btn.textContent = oldTxt;
+  }
+  if (!chunks.length) { $('expMsg').textContent = '录制失败，没拿到数据'; return; }
+  const blob = new Blob(chunks, { type: 'video/webm' });
+  download(blob, 'image2strokes-' + stamp() + '.webm');
+  $('expMsg').textContent = '视频已导出：约 ' + OUT_SEC + ' 秒快放 · ' + (blob.size / 1048576).toFixed(1) + ' MB';
+  finish();                                 // 回到"画完了"的状态
+}
+
+// 笔触脚本：笔形 + 轨迹 + 纯色 + 裁剪掩膜（PNG），可直接喂给别的绘图工具
+function exportJson() {
+  if (!STROKES.length) return;
+  const btn = $('expJson'), oldTxt = btn.textContent;
+  btn.disabled = true; btn.textContent = '打包中…';
+  $('expMsg').textContent = '正在打包裁剪掩膜…';
+  setTimeout(() => {
+    try {
+      const clips = CLIPS.map((c) => {
+        const cv = document.createElement('canvas');
+        cv.width = c.w; cv.height = c.h;
+        const x = cv.getContext('2d');
+        const id = x.createImageData(c.w, c.h);
+        for (let k = 0; k < c.mask.length; k++) {
+          id.data[k * 4] = 255; id.data[k * 4 + 1] = 255; id.data[k * 4 + 2] = 255;
+          id.data[k * 4 + 3] = c.mask[k] ? 255 : 0;
+        }
+        x.putImageData(id, 0, 0);
+        return { x: c.x, y: c.y, w: c.w, h: c.h, mask: cv.toDataURL('image/png') };
+      });
+      const data = {
+        format: 'image2strokes/1', W, H,
+        colors: STATS.colors, photo: !!STATS.photo, style: STATS.style, strokes: STROKES.length,
+        note: '每条笔触：rib/tp 是平铺坐标数组（[x0,y0,x1,y1,…]），color 是纯色 RGB，' +
+              'w 是笔宽，ms 是这一笔的时长，pen=1 表示硬笔尖；c 指向 clips 里的裁剪掩膜' +
+              '（PNG：白色不透明=可以落色，透明=裁掉），绘制时把 rib 多边形与掩膜求交再填 color 即可。',
+        strokes: STROKES, clips,
+      };
+      const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+      download(blob, 'image2strokes-' + stamp() + '.json');
+      $('expMsg').textContent = '笔触已导出：' + (blob.size / 1048576).toFixed(1) + ' MB';
+    } catch (e) {
+      $('expMsg').textContent = '导出失败：' + e.message;
+    } finally {
+      btn.disabled = false; btn.textContent = oldTxt;
+    }
+  }, 30);
+}
+
 // ---------------- 交互 ----------------
 function bindUI() {
   $('file').addEventListener('change', (e) => {
@@ -608,6 +745,9 @@ function bindUI() {
   $('cmp').addEventListener('change', () => {});
   $('tip').addEventListener('change', (e) => { showTip = e.target.checked; });
   $('guideChk').addEventListener('change', (e) => { showGuide = e.target.checked; });
+  $('expPng').addEventListener('click', exportPng);
+  $('expVideo').addEventListener('click', () => { exportVideo(); });
+  $('expJson').addEventListener('click', exportJson);
   document.addEventListener('keydown', (e) => {
     if (e.code === 'Space' && STROKES.length) { e.preventDefault(); $('play').click(); }
   });

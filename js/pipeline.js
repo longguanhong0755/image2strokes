@@ -502,6 +502,23 @@
     holeFill: true,         // 收尾补漏：把"还是没画上"的小洞逐个补掉（残差补笔有"太小/太散不补"的门槛）
     holeT: 28,              // 补漏的判定阈值（单通道差）
     holeMax: 420,           // 只补这么大的洞（像素数）；更大的块属于平涂风格化，补了会花
+    holeSeg: 48,            // 补漏一笔画多长（越长笔数越省）
+    // --- 交界过渡带（实测负收益，默认关；见 README 的坑 5）---
+    edgeFill: false,        // 沿色块交界补"中间色"细笔：边界像素在目标图里大多本来就是纯色，补了反而更差
+    edgeT: 10,              // 交界过渡带的阈值（单通道差）
+    edgeCd: 60,             // 只补"两边颜色差得远"的交界（RGB 曼哈顿距离）
+    edgeMax: 3200,          // 最多补多少处
+    edgeSeg: 40,            // 过渡带一笔多长
+    // --- 笔形/笔宽（风格预设会覆盖） ---
+    bwF: 0.16, bwMin: 9, bwMax: 46, coverOv: 0.62,      // 笔宽 = 块厚×bwF，限幅；档间重叠 coverOv
+    taperLo: 0.86, taperAmp: 0.20, taperWob: 0.08,      // 笔压：两头细、中间粗、再抖一点
+    // --- 起稿（"真起稿"会画得不准） ---
+    sketchGrid: 6,          // 起稿路径按这个网格随手简化（越大越不准、越像真起稿）
+    sketchOver: 5,          // 起稿两端的出锋（真起稿会画过头一点）
+    // --- 自动/档位 ---
+    autoColors: true,       // colors 为 0 时按纹理强度自动选色数（照片 32~36，插画 24）
+    style: 'marker',        // 笔触风格：marker（平涂马克笔）/ pencil（铅笔速写）/ oil（油画厚涂）
+    detail: 1,              // 细节档：0 快看 / 1 标准 / 2 慢工出细活
   };
 
   function regionMaskOf(compOf, W, compId, x0, y0, x1, y1) {
@@ -515,6 +532,23 @@
 
   async function run(px, W, H, opts, onProgress) {
     opts = Object.assign({}, CFG, opts || {});
+    // 细节档：只影响"补笔要补多细"，不影响主笔触的取色逻辑
+    if (opts.detail === 0) {
+      Object.assign(opts, { residual: [30, 24, 18, 14], holeT: 40, resMin: 1.2, sketchMax: 40, edgeFill: false });
+    } else if (opts.detail === 2) {
+      Object.assign(opts, { residual: [30, 24, 18, 14, 11, 9, 7, 5.5], holeT: 22, resMin: 0.8,
+                            resHalfA: 0.85, resHalfB: 0.55, sketchMax: 76, sketchGrid: 5, edgeT: 8 });
+    }
+    // 笔触风格：只改"笔形/笔宽/重叠/起稿笔感"，覆盖率的规则不动（保真优先）
+    if (opts.style === 'pencil') {
+      Object.assign(opts, { bwF: 0.10, bwMin: 7, bwMax: 30, coverOv: 0.55,
+                            taperLo: 0.74, taperAmp: 0.34, taperWob: 0.12,
+                            sketchHalf: 1.2, sketchGrid: 9, sketchOver: 8, bleedP: 0.16 });
+    } else if (opts.style === 'oil') {
+      Object.assign(opts, { bwF: 0.21, bwMin: 12, bwMax: 62, coverOv: 0.72,
+                            taperLo: 0.93, taperAmp: 0.11, taperWob: 0.05,
+                            sketchHalf: 2.6, sketchGrid: 4, sketchOver: 3, bleedP: 0.3, bleedR: 3 });
+    }
     const yieldUI = () => new Promise((r) => setTimeout(r, 0));
     const prog = (p, msg) => { if (onProgress) onProgress(p, msg); };
 
@@ -537,7 +571,20 @@
         Bs = box3(box3(Bs, W, H), W, H);
       }
       var texFracOut = texFrac;
+      // 照片自动模式：纹理强的图（照片/扫描件）单独一套参数——
+      // 色数提上去、笔更细、允许更多笔，不然平涂会把纹理糊成一格一格的色块。
+      if (texFrac > 0.06) {
+        opts.photoMode = true;
+        if (!opts.colors && opts.autoColors) opts.colors = texFrac > 0.14 ? 36 : 32;
+        if (opts.maxStrokes === CFG.maxStrokes) opts.maxStrokes = 26000;
+        if (opts.minArea === CFG.minArea) opts.minArea = texFrac > 0.14 ? 90 : 110;
+        if (opts.bwF === CFG.bwF) { opts.bwF = 0.12; opts.bwMin = 7; }
+        if (opts.coverOv === CFG.coverOv) opts.coverOv = 0.58;
+      }
     }
+    // 自动色数（插画类也走这里：没指定颜色数就按纹理强弱给个合适的）
+    if (!opts.colors && opts.autoColors) opts.colors = 24;
+    if (opts.debug) console.log(`[auto] 纹理 ${(texFracOut * 100).toFixed(1)}% → colors=${opts.colors} photo=${!!opts.photoMode} maxStrokes=${opts.maxStrokes} bwF=${opts.bwF}`);
 
     prog(0.02, '分析颜色…'); await yieldUI();
 
@@ -965,8 +1012,10 @@
                 Math.round(G[p0] * (1 - mix) + 72 * mix),
                 Math.round(B[p0] * (1 - mix) + 76 * mix)];
       };
+      const grid = Math.max(0, Math.round(opts.sketchGrid * strokeScale));
+      const over = Math.max(0, opts.sketchOver * strokeScale);
       for (const it of seq) {
-        const bw = bboxOfComp(ecc, it.ci, clipPad);
+        const bw = bboxOfComp(ecc, it.ci, clipPad + grid);
         const { sk } = thin(bw.m, bw.w, bw.h);
         const lp = longestPath(sk, bw.w, bw.h);
         if (!lp || lp.len < 4) continue;
@@ -977,9 +1026,31 @@
         }
         const mi = lp.len >> 1;
         const col = pencil(absPath[mi * 2], absPath[mi * 2 + 1]);
-        const cIdx = pushClip(bw.x, bw.y, bw.w, bw.h, dilate(bw.m, bw.w, bw.h, clipPad));
-        const rib = ribbon(absPath, lp.len, halfS);
-        emitStroke(rib, rib.length / 2, absPath, lp.len, halfS, col, 1, cIdx, -1, 0);
+        // 真起稿画不准、也不收锋：路径按网格"随手"简化，两端再画过头一点
+        let pth = absPath, pn = lp.len;
+        if (grid > 1 && lp.len >= 6) {
+          const simp = [];
+          const push = (x, y) => {
+            if (simp.length >= 2) {
+              const lx = simp[simp.length - 2], ly = simp[simp.length - 1];
+              if (Math.max(Math.abs(x - lx), Math.abs(y - ly)) < grid) return;
+            }
+            simp.push(x, y);
+          };
+          const d0x = absPath[0] - absPath[2], d0y = absPath[1] - absPath[3];
+          const l0 = Math.hypot(d0x, d0y) || 1;
+          push(absPath[0] + d0x / l0 * over, absPath[1] + d0y / l0 * over);
+          for (let i = 0; i < lp.len; i++) push(absPath[i * 2], absPath[i * 2 + 1]);
+          const e2 = (lp.len - 1) * 2;
+          const d1x = absPath[e2] - absPath[e2 - 2], d1y = absPath[e2 + 1] - absPath[e2 - 1];
+          const l1 = Math.hypot(d1x, d1y) || 1;
+          push(absPath[e2] + d1x / l1 * over, absPath[e2 + 1] + d1y / l1 * over);
+          if (simp.length >= 4) { pth = Float64Array.from(simp); pn = simp.length >> 1; }
+        }
+        // 粗线会偏出原始轮廓，掩膜相应放宽，免得被切成虚线
+        const cIdx = pushClip(bw.x, bw.y, bw.w, bw.h, dilate(bw.m, bw.w, bw.h, clipPad + grid));
+        const rib = ribbon(pth, pn, halfS);
+        emitStroke(rib, rib.length / 2, pth, pn, halfS, col, 1, cIdx, -1, 0);
       }
     }
 
@@ -1102,15 +1173,15 @@
           ? pushClip(rg.x0, rg.y0, clip.w, clip.h, dilate(clip.m, clip.w, clip.h, bleedRad))
           : cIdx;
         const ext0 = rg.hp * 2;
-        let bwid = clamp(ext0 * 0.16, 9 * strokeScale, 46 * strokeScale);
+        let bwid = clamp(ext0 * opts.bwF, opts.bwMin * strokeScale, opts.bwMax * strokeScale);
         // 手抖/弧度是"整个区块一起漂"，不是每一档各抖一个方向——否则相邻两档会漏缝。
         // 横向范围按最大漂移量外扩，保证区块边缘也被盖住（多出来的部分被裁形切掉）。
         const wobA = opts.organic ? Math.min(2.8, bwid * 0.13) : Math.min(2.6, bwid * 0.1);
         const bowA = opts.organic ? Math.min(2.4, bwid * 0.11) : 0;
         const dev = wobA + bowA;
         const ext = ext0 + 2 * dev;
-        let nP = Math.max(1, Math.ceil(ext / (bwid * 0.62)));   // 覆盖率 ≥ 62% 重叠
-        if (nP > 24) { nP = 24; bwid = Math.max(bwid, ext / (nP * 0.62)); }   // 档数封顶就加宽笔刷
+        let nP = Math.max(1, Math.ceil(ext / (bwid * opts.coverOv)));   // 档间足够重叠
+        if (nP > 24) { nP = 24; bwid = Math.max(bwid, ext / (nP * opts.coverOv)); }   // 档数封顶就加宽笔刷
         const ax = rg.ax, ay = rg.ay;
         const px2 = -ay, py2 = ax;
         const wobPh = rand01(ri * 7919 + 13, 1) * 6.283;        // 区块级相位（一起漂）
@@ -1140,8 +1211,9 @@
             const off = v + wobA * Math.sin(wobPhP + f * wobW) + bowP * Math.sin(Math.PI * f);
             path[s * 2] = rg.cx + ax * tt + px2 * off;
             path[s * 2 + 1] = rg.cy + ay * tt + py2 * off;
-            // 笔压：中间略粗、两头略细，再加一点不均匀
-            halfs[s] = (bwidP / 2) * (0.86 + 0.20 * Math.sin(Math.PI * f) + 0.08 * Math.sin(wobPhP + f * 3.1));
+            // 笔压：两头细、中间粗，再抖一点（风格预设会给不同的 taper）
+            halfs[s] = (bwidP / 2) * (opts.taperLo + opts.taperAmp * Math.sin(Math.PI * f)
+                                      + opts.taperWob * Math.sin(wobPhP + f * 3.1));
           }
           const useClip = (opts.bleedP > 0 && rand01(seed, 13) < opts.bleedP) ? cBleed : cIdx;
           if (opts.localColor) {
@@ -1162,6 +1234,9 @@
     if ((opts.residual && opts.residual.length) || opts.returnCanvas || opts.returnKeys) {
       const canvas = new Uint8Array(N * 3);
       canvas.fill(255);
+      // 几何覆盖图：像素是否被任何一笔的笔形真正盖到（不看羽化）。
+      // 羽化会把笔形边缘"糊"到相邻像素上，那只是光栅层的错觉，网页端是硬边裁剪，会露白点。
+      const cover = new Uint8Array(N);
       const raster = (ribArr, color, clipIdx) => {
         const cl = clips[clipIdx];
         let xmin = Infinity, ymin = Infinity, xmax = -Infinity, ymax = -Infinity;
@@ -1189,6 +1264,7 @@
             const xx = xmin + x;
             if (!cl.mask[rowC + (xx - cl.x)]) continue;
             const pp = yy * W + xx;
+            cover[pp] = 1;
             if (al >= 0.995) {
               canvas[pp * 3] = color[0]; canvas[pp * 3 + 1] = color[1]; canvas[pp * 3 + 2] = color[2];
             } else {
@@ -1425,7 +1501,6 @@
       //      B) 剩余的"小块/细条"错误——用厚度判定，大而厚的块仍跳过（那是平涂风格化本身）
       if (opts.holeFill) {
         const thrH = clamp(opts.holeT * strokeScale, 16, 72);
-        const whiteish = (i) => canvas[i * 3] >= 245 && canvas[i * 3 + 1] >= 245 && canvas[i * 3 + 2] >= 245;
         const errAt = (i) => Math.max(Math.abs(canvas[i * 3] - R[i]),
                                       Math.abs(canvas[i * 3 + 1] - G[i]),
                                       Math.abs(canvas[i * 3 + 2] - B[i]));
@@ -1456,10 +1531,14 @@
               absPath[i * 2] = lp.pts[i * 2] + x0;
               absPath[i * 2 + 1] = lp.pts[i * 2 + 1] + y0;
             }
-            const segs = pathSegments(absPath, lp.len, Math.max(24, half * 4));
+            // 一笔画长一点（笔数省），颜色按段取局部目标色（长条上颜色是渐变的，用一个均值色会不准）
+            const segLen = Math.max(24, opts.holeSeg * strokeScale);
+            const segs = pathSegments(absPath, lp.len, segLen);
             for (const sg of segs) {
               if (sg.n < 2) continue;
-              emitRaster(ribbon(sg.pts, sg.n, half), sg.pts, sg.n, half, col, col[0] < 120 ? 1 : 0, cIdx, 3);
+              const rb = ribbon(sg.pts, sg.n, half);
+              const cSeg = sampleColor(rb, rb.length / 2, bin, x0, y0, mw, mh) || col;
+              emitRaster(rb, sg.pts, sg.n, half, cSeg, cSeg[0] < 120 ? 1 : 0, cIdx, 3);
             }
           } else {
             const cx0 = (x0 + x1) / 2, cy0 = (y0 + y1) / 2;
@@ -1472,22 +1551,32 @@
             emitRaster(poly, [cx0, cy0], 1, rad, col, 0, cIdx, 3);
           }
         };
-        const fillMask = (mask, limit) => {
+        const fillMask = (mask, limit, maxAdd) => {
+          const base = strokes.length;
           const cc2 = compsOfLabels(mask, W, H);
           const list = [];
           for (let ci = 0; ci < cc2.comps.length; ci++) if (cc2.comps[ci].label === 1) list.push(ci);
           list.sort((a, b) => cc2.comps[b].count - cc2.comps[a].count);
           let n = 0;
-          for (const ci of list.slice(0, limit)) { fillComp(cc2.comps[ci], cc2); n++; }
+          for (const ci of list.slice(0, limit)) {
+            if (maxAdd && strokes.length - base >= maxAdd) break;
+            fillComp(cc2.comps[ci], cc2); n++;
+          }
           return n;
         };
-        // A) 真空白
+        // A) 真空白：这块**没有任何一笔的笔形盖到**（看几何覆盖，不看羽化）。
+        //    网页端是硬边裁剪，羽化的"盖到一点"在那边会发白，所以按几何判定最准。
+        //    只补"原图不是白的"地方，免得把干净的白底也补一遍。
         let nA = 0;
         {
           const m = new Uint8Array(N);
           let any = 0;
-          for (let i = 0; i < N; i++) if (whiteish(i) && errAt(i) > thrH) { m[i] = 1; any++; }
-          if (any) nA = fillMask(m, 3000);
+          for (let i = 0; i < N; i++) {
+            if (cover[i]) continue;
+            const dW = Math.max(255 - R[i], 255 - G[i], 255 - B[i]);
+            if (dW > thrH) { m[i] = 1; any++; }
+          }
+          if (any) nA = fillMask(m, 3000, 0);
         }
         // B) 剩余的小块/细条错误（A 补完后重新算，已经补上的不再重复）。
         //    这里的阈值放宽一倍：照片这类纹理区里，一小块错误用的是一个均值色，
@@ -1507,12 +1596,43 @@
               for (let k = 0; k < c.count; k++) m[cc2.pix[c.start + k]] = 0;
             }
           }
-          nB = fillMask(m, 2500);
+          nB = fillMask(m, 2500, 4200);
         }
-        if (nA || nB) {
+        // C) 交界过渡带：两个色块硬碰硬的地方，目标图那一两像素是混色，
+        //    我们画的是纯色，差值就是"可见差异"的主要来源——沿交界补上目标色本身
+        let nC = 0;
+        if (opts.edgeFill) {
+          // 只在"两边颜色差得远"的交界上补：差得近的话混色像素本来就没多少误差，
+          // 补上去只是把已经对的像素刷成中间色（实测会把平均差抬高）
+          const colOf = new Map();
+          for (const rg of regions) colOf.set(rg.cid, rg.color);
+          const bigEdge = new Uint8Array(N);
+          for (let y = 0; y < H; y++) {
+            for (let x = 0; x < W; x++) {
+              const p = y * W + x, c0 = compOf[p];
+              let c1 = -1;
+              if (x + 1 < W && compOf[p + 1] !== c0) c1 = compOf[p + 1];
+              else if (y + 1 < H && compOf[p + W] !== c0) c1 = compOf[p + W];
+              else if (x > 0 && compOf[p - 1] !== c0) c1 = compOf[p - 1];
+              else if (y > 0 && compOf[p - W] !== c0) c1 = compOf[p - W];
+              if (c1 < 0) continue;
+              const A = colOf.get(c0), Bv = colOf.get(c1);
+              if (!A || !Bv) continue;
+              if (Math.abs(A[0] - Bv[0]) + Math.abs(A[1] - Bv[1]) + Math.abs(A[2] - Bv[2]) < opts.edgeCd) continue;
+              bigEdge[p] = 1;
+            }
+          }
+          const band = dilate(bigEdge, W, H, 1);
+          const thrC = clamp(opts.edgeT * strokeScale, 6, 20);
+          const m = new Uint8Array(N);
+          let any = 0;
+          for (let i = 0; i < N; i++) if (band[i] && errAt(i) > thrC) { m[i] = 1; any++; }
+          if (any) nC = fillMask(m, opts.edgeMax, 4200);
+        }
+        if (nA || nB || nC) {
           let bad2 = 0;
           for (let i = 0; i < N; i++) if (errAt(i) > 8) bad2++;
-          prog(0.995, `收尾补漏… 空白 ${nA} 处、碎块 ${nB} 处（可见差异 ${(bad2 / N * 100).toFixed(2)}%）`);
+          prog(0.995, `收尾补漏… 空白 ${nA} 处、碎块 ${nB} 处、交界 ${nC} 处（可见差异 ${(bad2 / N * 100).toFixed(2)}%）`);
           await yieldUI();
         }
       }
@@ -1551,6 +1671,10 @@
         strokes: strokes.length,
         totalMs: strokes.reduce((a, s) => a + s.ms, 0),
         phases: [0, 1, 2, 3].map((ph) => strokes.filter((s) => s.ph === ph).length),
+        colors: opts.colors,
+        photo: !!opts.photoMode,
+        style: opts.style,
+        detail: opts.detail,
       },
     };
   }

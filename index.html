@@ -83,10 +83,27 @@
       <div class="row">
         <span style="min-width:64px">颜色数</span>
         <select id="colors">
+          <option value="0" selected>自动（按图片判断）</option>
           <option value="16">16 · 更像简笔</option>
-          <option value="24" selected>24 · 标准</option>
+          <option value="24">24 · 标准</option>
           <option value="32">32 · 更细腻</option>
           <option value="40">40 · 照片友好</option>
+        </select>
+      </div>
+      <div class="row">
+        <span style="min-width:64px">笔触风格</span>
+        <select id="style">
+          <option value="marker" selected>平涂马克笔（默认）</option>
+          <option value="pencil">铅笔速写（笔更细）</option>
+          <option value="oil">油画厚涂（笔更宽）</option>
+        </select>
+      </div>
+      <div class="row">
+        <span style="min-width:64px">过程时长</span>
+        <select id="detail">
+          <option value="0">快看 · 2 分钟</option>
+          <option value="1" selected>标准 · 4 分钟</option>
+          <option value="2">慢工出细活 · 8 分钟</option>
         </select>
       </div>
       <div class="row">
@@ -124,6 +141,12 @@
         <div class="phases" id="phases">
           <span>① 起稿</span><span>② 铺色</span><span>③ 收形</span><span>④ 点睛</span>
         </div>
+        <div class="controls" style="margin-top:10px">
+          <button id="expVideo" class="ghost" disabled>导出视频</button>
+          <button id="expJson" class="ghost" disabled>导出笔触</button>
+          <button id="expPng" class="ghost" disabled>存成品图</button>
+          <span id="expMsg" style="color:var(--sub);font-size:12.5px"></span>
+        </div>
         <div id="stat"></div>
       </div>
       <div id="welcome">
@@ -153,6 +176,6 @@
   <b>说明：</b>示例图为公有领域 / CC0 素材，仅用于演示；上传自己的图片时全部处理都在本机浏览器里进行，不会上传到任何服务器。
 </div>
 
-<script src="js/app.js"></script>
+<script src="js/app.js?v=4"></script>
 </body>
 </html>
