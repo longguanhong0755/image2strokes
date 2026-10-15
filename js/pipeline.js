@@ -502,7 +502,8 @@
     inkEarly: false,        // 调试开关：勾线层放到铺色之前（默认 "铺色 → 勾线收形"，见 README 的坑 4）
     holeFill: true,         // 收尾补漏：把"还是没画上"的小洞逐个补掉（残差补笔有"太小/太散不补"的门槛）
     holeT: 28,              // 补漏的判定阈值（单通道差）
-    holeWhite: 244,         // 画布上"三通道都 ≥ 它"才算这点是白的（原图判定用 holeWhite-16，更宽）
+    holeWhite: 244,         // "看着是白的"门槛（这一类补验：原图明显更深的）
+    holePaper: 254,         // "纸面根本没涂上"门槛（三通道都 ≥ 它 = 那像素还是白纸），原图比它深 8 以上就补
     holeMax: 420,           // 只补这么大的洞（像素数）；更大的块属于平涂风格化，补了会花
     holeSeg: 48,            // 补漏一笔画多长（越长笔数越省）
     // --- 交界过渡带（实测负收益，默认关；见 README 的坑 5）---
@@ -1598,10 +1599,15 @@
           const m = new Uint8Array(N);
           let any = 0;
           for (let i = 0; i < N; i++) {
-            // 画布用 holeWhite（严），原图用 holeWhite-16（宽）——必须"原图门槛 ≤ 画布门槛"，
-            // 否则把目标色补上去之后这点仍然算白，会反复补、补不掉。
-            if (Math.min(canvas[i * 3], canvas[i * 3 + 1], canvas[i * 3 + 2]) < opts.holeWhite) continue;
-            if (Math.min(R[i], G[i], B[i]) >= opts.holeWhite - 16) continue;   // 原图这里本来就是白的
+            const cmn = Math.min(canvas[i * 3], canvas[i * 3 + 1], canvas[i * 3 + 2]);
+            const tmn = Math.min(R[i], G[i], B[i]);
+            // 两类白点：
+            // ① 纸面根本没被涂上（三通道都 ≥ holePaper）——只要原图不是纯白就要补，
+            //    这样"全满的图"成品上就不会再有没有上色的地方（哪怕原图那里很浅）；
+            // ② 只被抗锯齿毛边蹭到 / 被浅色笔盖错（≥ holeWhite 而原图明显更深）。
+            // 门槛必须满足"原图 ≤ 画布"，否则补上目标色后仍然算白，会反复补、补不掉。
+            if (!((cmn >= opts.holeWhite && tmn < opts.holeWhite - 16) ||    // 半覆盖/被浅色盖错
+                  (cmn >= opts.holePaper && tmn < opts.holePaper - 8))) continue;   // "整块白纸"才算这一条
             m[i] = 1; any++;
           }
           if (!any) break;

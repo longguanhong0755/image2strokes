@@ -18,6 +18,8 @@ let keys = [];                 // 关键帧快照 {i, data} 或 {i, rgb}（管�
 let keyEvery = 0;
 let KEYFRAMES = [];
 let selfChecking = false;         // 成品自检（找白点）进行中：期间 hud 不覆盖状态行
+let rushing = false;              // "看成品"：快进到画完（每帧画一大批，画面看得见在飞速推进）
+let draggingSeek = false;         // 正在拖进度条：这期间 hud 不要回写滑块位置
 let checkMsg = '';                // 自检结论（挂在状态行末尾，一直都在）
 // "像人在画"需要的三段时间轴：抬笔移动 travel + 换阶段停顿 beat + 落笔绘制 paint
 let travels = null, beats = null, msPaint = null;
@@ -94,7 +96,7 @@ function startExtract(imgCanvas) {
   };
   targetMs = opts.targetSec * 1000;
   if (!worker) {
-    worker = new Worker('js/worker.js?v=6');
+    worker = new Worker('js/worker.js?v=7');
     worker.onmessage = onWorker;
     worker.onerror = (e) => { $('status').textContent = '出错：' + e.message; };
   }
@@ -399,9 +401,14 @@ function drawGuide(ctx, tp, c) {
 let lastTickAt = 0;
 function tick() {
   const now = performance.now();
+  const gap = now - lastTickAt;          // 距上一帧多久（被节流时会是秒/分钟级）
   lastTickAt = now;
   const dt = Math.min(100, now - lastT); lastT = now;
-  if (playing && !done) {
+  if (rushing && !done) {                    // 快进到成品：每帧画 2500 笔
+    let n = 0;
+    while (idx < STROKES.length && n++ < 2500) { paintStroke(idx, 1); idx++; }
+    if (idx >= STROKES.length) { rushing = false; finish(); }
+  } else if (playing && !done) {
     acc += dt * speed;
     let guard = 0;
     while (idx < STROKES.length && guard++ < 400) {
@@ -419,7 +426,7 @@ function tick() {
       else { endTravel(); paintStroke(idx, clamp((acc - tv) / msPaint[idx], 0, 1)); }
     }
   }
-  if (checkState) stepSelfCheck();          // 成品自检：按帧分片推进
+  if (checkState) stepSelfCheck(gap);       // 成品自检：按帧分片推进（帧慢就多干点）
   flushMain();
   hud();
   schedule();
@@ -466,6 +473,8 @@ function hud() {
   const p = STATS.totalMs > 0 ? cur / STATS.totalMs : 0;
   $('fill').style.width = (p * 100).toFixed(2) + '%';
   $('clock').textContent = fmt(cur / 1000) + ' / ' + fmt(STATS.totalMs / 1000);
+  const sk = $('seek');
+  if (sk && !draggingSeek) sk.value = String(Math.round(p * 1000));   // 进度条跟着跑（拖动时别抢）
   const ph = done ? 4 : (st && st.ph !== undefined ? st.ph : 1);
   setPhase(ph);
   if (!done) {
@@ -488,7 +497,7 @@ function fmt(s) {
 }
 
 function resetPlayback() {
-  idx = 0; acc = 0; done = false; cursor = null; guide = null; airPath = null;
+  idx = 0; acc = 0; done = false; rushing = false; cursor = null; guide = null; airPath = null;
   pending = -1; pendRect = null;
   const ctx = painted.getContext('2d');
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -552,8 +561,12 @@ function advanceTo(tgt) {
 // "算白"的两个门槛必须满足：原图门槛 ≤ 画布门槛。
 // 这样"把目标色画上去"一定能消掉白点（否则会出现补了还是白点的死循环）；
 // 同时画布门槛取得严一点（244），浅色区块不会被误判成白点而乱补。
-const WHITE_CANVAS = 244;          // 画布上"三通道都 ≥ 它"才算这点是白的
-const WHITE_TARGET = 228;          // 原图"三通道都 ≥ 它"就认为本来就白，不用管
+// "没涂上色"的两个口径（都必须满足"原图门槛 ≤ 画布门槛"，否则补上目标色后仍算白点、消不掉）：
+//   ① 纸面根本没被涂上（WHITE_PAPER = 纯白）：只要原图明显不是白就补——保证"全满的图"成品上没有空白处；
+//   ② 只被抗锯齿毛边蹭到 / 被浅色笔盖错（WHITE_CANVAS + 原图明显更深）。
+const WHITE_PAPER = 254;
+const WHITE_CANVAS = 244;
+const WHITE_TARGET = 228;
 const isWhite = (r, g, b, t) => r >= t && g >= t && b >= t;
 function whiteDots(dest) {
   let im;
@@ -564,8 +577,10 @@ function whiteDots(dest) {
   let any = 0;
   for (let p = 0; p < W * H; p++) {
     const q = p * 4;
-    if (!isWhite(im[q], im[q + 1], im[q + 2], WHITE_CANVAS)) continue;   // 这里已经有颜色了
-    if (isWhite(tgt[q], tgt[q + 1], tgt[q + 2], WHITE_TARGET)) continue; // 原图本来就是白的
+    const cmn = Math.min(im[q], im[q + 1], im[q + 2]);
+    const tmn = Math.min(tgt[q], tgt[q + 1], tgt[q + 2]);
+    if (!((cmn >= WHITE_CANVAS && tmn < WHITE_TARGET) ||
+          (cmn >= WHITE_PAPER && tmn < WHITE_PAPER - 8))) continue;
     m[p] = 1; any++;
   }
   const out = [];
@@ -619,7 +634,7 @@ function addDotStroke(cl, grow, dest) {
         const k = (y - y0) * w0 + (x - x0);
         if (mask[k]) continue;
         const q = (y * W + x) * 4;
-        if (isWhite(tgt[q], tgt[q + 1], tgt[q + 2], WHITE_TARGET)) continue;   // 该是白的地方不收
+        if (Math.min(tgt[q], tgt[q + 1], tgt[q + 2]) >= WHITE_PAPER) continue;   // 原图纯白的地方不收
         mask[k] = 1;
         cr += tgt[q]; cg += tgt[q + 1]; cb += tgt[q + 2]; cnt++;
       }
@@ -660,13 +675,16 @@ function startSelfCheck(head) {
   $('stat').innerHTML = (head || '') + ' · 白点自检中…';
   return checkState;
 }
-function stepSelfCheck() {
+function stepSelfCheck(gap) {
   const cs = checkState;
   if (!cs) { selfChecking = false; return; }
   if (cs.gen !== selfCheckGen) { checkState = null; selfChecking = false; return; }
   if (cs.phase === 1) {                                     // 重画（每帧一片）
-    const end = Math.min(cs.from, cs.i + 1024);
-    for (; cs.i < end; cs.i++) paintStroke(cs.i, 1, cs.cv);
+    // 每帧的工作量按"上一帧隔了多久"自适应：正常帧 250ms 一批，页面被节流时一帧顶几十秒，
+    // 就一次多画一些（最多 5 秒），否则自检要等十几分钟。
+    const budget = (gap || 0) > 800 ? 5000 : 250;
+    const t0 = performance.now();
+    while (cs.i < cs.from && performance.now() - t0 < budget) { paintStroke(cs.i, 1, cs.cv); cs.i++; }
     if (cs.i >= cs.from) cs.phase = 2;
     return;
   }
@@ -729,7 +747,7 @@ function diffVsTarget() {
 }
 
 function finish() {
-  done = true; playing = false; cursor = null; guide = null; airPath = null;
+  done = true; playing = false; rushing = false; cursor = null; guide = null; airPath = null;
   $('play').textContent = '重播';
   setPhase(4);
   const d = diffVsTarget();
@@ -902,11 +920,43 @@ function bindUI() {
     speed = parseFloat(e.target.value);
     $('speedVal').textContent = speed.toFixed(2).replace(/0$/, '') + '×';
   });
+  // 进度条：拖动时只更新读数（拖动本身会连续重画上千笔，会卡）；松手/实时轻量跳转
+  let lastSeekAt = 0;
+  $('seek').addEventListener('pointerdown', () => { draggingSeek = true; });
+  window.addEventListener('pointerup', () => { draggingSeek = false; });
   $('seek').addEventListener('input', (e) => {
+    if (!STROKES.length) return;
+    const sec = parseFloat(e.target.value) / 1000 * (STATS.totalMs / 1000);
+    $('clock').textContent = fmt(sec) + ' / ' + fmt(STATS.totalMs / 1000);
+    const now = performance.now();
+    if (now - lastSeekAt < 150) return;       // 拖动中最多 6~7 次/秒做实际定位
+    lastSeekAt = now;
+    playing = false;
+    $('play').textContent = '继续';
+    jumpTo(sec);
+  });
+  $('seek').addEventListener('change', (e) => {          // 松手：精确定位
     if (!STROKES.length) return;
     playing = false;
     $('play').textContent = '继续';
     jumpTo(parseFloat(e.target.value) / 1000 * (STATS.totalMs / 1000));
+  });
+  $('toEnd').addEventListener('click', () => {           // 看成品：快进到画完
+    if (!STROKES.length) return;
+    if (done) { resetPlayback(); return; }
+    rushing = true; playing = true; $('play').textContent = '暂停';
+    $('stat').textContent = '快进到成品…';
+  });
+  document.querySelectorAll('#phases span').forEach((el) => {
+    el.addEventListener('click', () => {                 // 点阶段名 → 跳到该阶段开头
+      const ph = parseInt(el.getAttribute('data-ph'), 10);
+      if (!STROKES.length || !cumMs) return;
+      let i = 0;
+      while (i < STROKES.length && (STROKES[i].ph | 0) !== ph) i++;
+      if (i >= STROKES.length) return;
+      playing = false; $('play').textContent = '继续';
+      jumpTo(cumMs[i] / 1000);
+    });
   });
   $('cmp').addEventListener('change', () => {});
   $('tip').addEventListener('change', (e) => { showTip = e.target.checked; });

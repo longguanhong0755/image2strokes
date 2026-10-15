@@ -140,17 +140,17 @@ console.log(`[aa] 模拟渲染 ${(Date.now() - t1) / 1000}s`);
   console.log(`[aa] 成品口径 平均差 ${(sum / (w * h * 3)).toFixed(2)}/255  可见差异 ${(bad / (w * h * 3) * 100).toFixed(2)}%  笔数 ${strokes.length}`);
 }
 
-// 空白点：结果接近纯白（≥245）而原图不白（亮度<200）
+// 空白点：与网页端同一口径——① 纸面没涂上（三通道 ≥250）而原图不是纯白；② 只有毛边（≥244）而原图明显更深
 const isWhite = new Uint8Array(w * h);
 let whiteTot = 0;
 for (let p = 0; p < w * h; p++) {
-  if (canvas[p * 3] >= 245 && canvas[p * 3 + 1] >= 245 && canvas[p * 3 + 2] >= 245) { isWhite[p] = 1; whiteTot++; }
+  if (canvas[p * 3] >= 250 && canvas[p * 3 + 1] >= 250 && canvas[p * 3 + 2] >= 250) { isWhite[p] = 1; whiteTot++; }
 }
 const want = [];
 for (let p = 0; p < w * h; p++) {
-  if (!isWhite[p]) continue;
-  const l = 0.299 * px[p * 4] + 0.587 * px[p * 4 + 1] + 0.114 * px[p * 4 + 2];
-  if (l < 200) want.push(p);
+  const cmn = Math.min(canvas[p * 3], canvas[p * 3 + 1], canvas[p * 3 + 2]);
+  const tmn = Math.min(px[p * 4], px[p * 4 + 1], px[p * 4 + 2]);
+  if ((cmn >= 244 && tmn < 228) || (cmn >= 254 && tmn < 246)) want.push(p);
 }
 const seen = new Uint8Array(w * h);
 const comps = [];
@@ -166,10 +166,12 @@ for (const s of want) {
       const xx = x + dx, yy = y + dy;
       if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
       const pp = yy * w + xx;
-      if (!seen[pp] && isWhite[pp]) {
-        const l = 0.299 * px[pp * 4] + 0.587 * px[pp * 4 + 1] + 0.114 * px[pp * 4 + 2];
-        if (l < 200) { seen[pp] = 1; q.push(pp); }
-      }
+      const vOk = (() => {
+        const cmn = Math.min(canvas[pp * 3], canvas[pp * 3 + 1], canvas[pp * 3 + 2]);
+        const tmn = Math.min(px[pp * 4], px[pp * 4 + 1], px[pp * 4 + 2]);
+        return (cmn >= 244 && tmn < 228) || (cmn >= 254 && tmn < 246);
+      })();
+      if (!seen[pp] && vOk) { seen[pp] = 1; q.push(pp); }
     }
   }
   comps.push({ n, x0, y0, x1, y1, p: s });

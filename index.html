@@ -134,12 +134,13 @@
         <canvas id="cv" width="1024" height="1024"></canvas>
         <div class="controls">
           <button id="play" class="primary">暂停</button>
+          <button id="toEnd" class="ghost" title="直接快进到画完">看成品</button>
           <span id="clock">0:00 / 0:00</span>
-          <input id="seek" class="seek" type="range" min="0" max="1000" value="0">
+          <input id="seek" class="seek" type="range" min="0" max="1000" value="0" title="拖动定位">
         </div>
         <div class="barwrap" style="margin-top:8px"><div id="fill"></div></div>
-        <div class="phases" id="phases">
-          <span>① 起稿</span><span>② 铺色</span><span>③ 收形</span><span>④ 点睛</span>
+        <div class="phases" id="phases" title="点一下跳到该阶段">
+          <span data-ph="0">① 起稿</span><span data-ph="1">② 铺色</span><span data-ph="2">③ 收形</span><span data-ph="3">④ 点睛</span>
         </div>
         <div class="controls" style="margin-top:10px">
           <button id="expVideo" class="ghost" disabled>导出视频</button>
@@ -176,6 +177,6 @@
   <b>说明：</b>示例图为公有领域 / CC0 素材，仅用于演示；上传自己的图片时全部处理都在本机浏览器里进行，不会上传到任何服务器。
 </div>
 
-<script src="js/app.js?v=6"></script>
+<script src="js/app.js?v=7"></script>
 </body>
 </html>
