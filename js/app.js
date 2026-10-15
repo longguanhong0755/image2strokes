@@ -122,23 +122,10 @@ function onWorker(e) {
     (STATS.photo ? ' · 已按照片自动用 <em>' + STATS.colors + '</em> 色' : (STATS.colors ? ' · ' + STATS.colors + ' 色' : ''));
   for (const id of ['expVideo', 'expJson', 'expPng']) { const b = $(id); if (b) b.disabled = false; }
   $('expMsg').textContent = '';
-  // 先做成品自检（白点归零再开播），完事自动开始
-  playing = false;
-  $('play').textContent = '开始';
-  const head = $('stat').innerHTML;
-  selfCheck().then((r) => {
-    if (r.stale) return;                 // 已被新一轮提炼取代
-    buildTimeline();
-    resetPlayback();
-    checkMsg = ' · 白点自检 <em>' + (r.left === 0 ? '0 个' : r.left + ' 个残留') + '</em>' +
-      (r.added ? '（补 ' + r.added + ' 笔）' : '');
-    $('stat').innerHTML = head + checkMsg;
-    playing = true;
-    $('play').textContent = '暂停';
-  }).catch(() => {                       // 自检出错也不能挡着画画
-    selfChecking = false; buildTimeline(); resetPlayback();
-    playing = true; $('play').textContent = '暂停';
-  });
+  // 开播；白点自检在后台画布上推进，补笔备好后追加到时间轴末尾（不挡着画画）
+  playing = true;
+  $('play').textContent = '暂停';
+  startSelfCheck($('stat').innerHTML);
 }
 
 // ---------------- 画布 ----------------
@@ -234,7 +221,7 @@ function clipCanvasFor(c) {
 
 // 画一笔（u=1 为整笔）。u<1 时只把"半成品"放进临时画布，不落到成品
 let pending = -1, pendRect = null;
-function paintStroke(i, u) {
+function paintStroke(i, u, dest) {
   const st = STROKES[i];
   const cl = CLIPS[st.c];
   const t = tipAt(st, u);
@@ -280,7 +267,7 @@ function paintStroke(i, u) {
   tmp.globalCompositeOperation = 'destination-in';  // 用遮罩裁形
   tmp.drawImage(clipCanvasFor(st.c), rect.x, rect.y);
   tmp.globalCompositeOperation = 'source-over';
-  const ctx = painted.getContext('2d');
+  const ctx = (dest || painted).getContext('2d');
   ctx.drawImage(tmpC, rect.x, rect.y, rect.w, rect.h, rect.x, rect.y, rect.w, rect.h);
   if (u >= 1) {
     pending = -1; pendRect = null;
@@ -432,6 +419,7 @@ function tick() {
       else { endTravel(); paintStroke(idx, clamp((acc - tv) / msPaint[idx], 0, 1)); }
     }
   }
+  if (checkState) stepSelfCheck();          // 成品自检：按帧分片推进
   flushMain();
   hud();
   schedule();
@@ -567,9 +555,9 @@ function advanceTo(tgt) {
 const WHITE_CANVAS = 244;          // 画布上"三通道都 ≥ 它"才算这点是白的
 const WHITE_TARGET = 228;          // 原图"三通道都 ≥ 它"就认为本来就白，不用管
 const isWhite = (r, g, b, t) => r >= t && g >= t && b >= t;
-function whiteDots() {
+function whiteDots(dest) {
   let im;
-  try { im = painted.getContext('2d').getImageData(0, 0, W, H).data; }
+  try { im = (dest || painted).getContext('2d').getImageData(0, 0, W, H).data; }
   catch (e) { return []; }
   const tgt = target.data;
   const m = new Uint8Array(W * H);
@@ -611,7 +599,7 @@ function whiteDots() {
 
 // 每个白点补一个"方点笔"：掩膜严格等于这一块，笔形外扩 1px（保证像素中心一定落在笔形里），
 // 颜色取目标图这一块的平均色。方框只被掩膜裁到那几个像素上，周围正确的像素不受影响。
-function addDotStroke(cl, grow) {
+function addDotStroke(cl, grow, dest) {
   const tgt = target.data;
   const g = grow || 0;                       // 顽固白点：一轮没补掉就把掩膜和笔形再外扩一圈
   const x0 = Math.max(0, cl.x0 - g), y0 = Math.max(0, cl.y0 - g);
@@ -647,34 +635,62 @@ function addDotStroke(cl, grow) {
     color: [Math.round(cr / cnt), Math.round(cg / cnt), Math.round(cb / cnt)],
     pen: 0, c: CLIPS.length - 1, r: -1, ph: 3, ms: 260,
   });
-  paintStroke(STROKES.length - 1, 1);
+  paintStroke(STROKES.length - 1, 1, dest);
 }
 
+// 成品自检：在**自己的画布**上把整幅重画一遍，扫"该有色却是白的"像素并补笔，扫到 0 才收手。
+// 三件事决定了它必须这么写：
+//   1) 不能挡住开播——用户在等的是"开始画"，所以自检在后台跑，播放照常；
+//   2) 不能依赖 setTimeout/await 链——标签页被节流时那种链会长时间不回来，页面看着像死了；
+//      改由主循环 tick() 分片推进（rAF 和 50ms 看门狗双驱动，播放能跑它就一定能跑）；
+//   3) 不能和正在播放的成品抢画布——用自己的离屏画布，补笔备好后追加到时间轴末尾
+//      （这时播放通常才到"铺色"，远没到末尾的收尾补笔）。
 let selfCheckGen = 0;
-async function selfCheck() {
-  const gen = ++selfCheckGen;         // 又选了一张图时，上一轮自检要立刻让位
+let checkState = null;            // { gen, phase, i, round, added, left, head, cv }
+let chkC = null;                  // 自检用的离屏画布
+function startSelfCheck(head) {
+  if (!chkC || chkC.width !== W || chkC.height !== H) {
+    chkC = document.createElement('canvas'); chkC.width = W; chkC.height = H;
+  }
+  const cx = chkC.getContext('2d');
+  cx.setTransform(1, 0, 0, 1, 0, 0);
+  cx.fillStyle = '#ffffff'; cx.fillRect(0, 0, W, H);
+  checkState = { gen: ++selfCheckGen, phase: 1, i: 0, round: 0, added: 0, left: 0, head: head || '', cv: chkC, from: STROKES.length };
   selfChecking = true;
-  for (let i = 0; i < STROKES.length; i++) {              // 先把整幅重画一遍（分片，界面不假死）
-    paintStroke(i, 1);
-    if ((i & 2047) === 2047) {
-      $('stat').textContent = '成品自检：重画一遍 ' + Math.round(i / STROKES.length * 100) + '%';
-      await new Promise((r) => setTimeout(r, 0));
-      if (gen !== selfCheckGen) { selfChecking = false; return { added: 0, left: -1, stale: true }; }
+  $('stat').innerHTML = (head || '') + ' · 白点自检中…';
+  return checkState;
+}
+function stepSelfCheck() {
+  const cs = checkState;
+  if (!cs) { selfChecking = false; return; }
+  if (cs.gen !== selfCheckGen) { checkState = null; selfChecking = false; return; }
+  if (cs.phase === 1) {                                     // 重画（每帧一片）
+    const end = Math.min(cs.from, cs.i + 1024);
+    for (; cs.i < end; cs.i++) paintStroke(cs.i, 1, cs.cv);
+    if (cs.i >= cs.from) cs.phase = 2;
+    return;
+  }
+  const dots = whiteDots(cs.cv);
+  cs.left = dots.length;
+  if (!cs.left || cs.round >= 8) { finishSelfCheck(); return; }    // 扫到 0 个才收手
+  const grow = cs.round >= 2 ? Math.min(2, cs.round - 1) : 0;      // 三轮还没清掉的：掩膜外扩再补
+  for (const cl of dots) { addDotStroke(cl, grow, cs.cv); cs.added++; }
+  cs.round++;
+}
+function finishSelfCheck() {
+  const cs = checkState;
+  if (!cs) return;
+  checkState = null; selfChecking = false;
+  checkMsg = ' · 白点自检 <em>' + (cs.left === 0 ? '0 个' : cs.left + ' 个残留') + '</em>' +
+    (cs.added ? '（补 ' + cs.added + ' 笔）' : '');
+  if (cs.added) {
+    buildTimeline();                 // 补笔已追加在最后：重建时间轴，它们会在收尾阶段被画上
+    if (done || idx >= STROKES.length) {   // 万一已经画完了：直接补到成品上
+      for (let i = cs.from; i < STROKES.length; i++) paintStroke(i, 1);
+      idx = STROKES.length; done = true;
     }
   }
-  let added = 0, left = 0;
-  for (let round = 0; round < 8; round++) {
-    const dots = whiteDots();
-    left = dots.length;
-    if (!left) break;                                          // 扫到 0 个才收手
-    $('stat').textContent = '成品自检：补白点（第 ' + (round + 1) + ' 遍，' + left + ' 处）…';
-    await new Promise((r) => setTimeout(r, 0));
-    if (gen !== selfCheckGen) { selfChecking = false; return { added, left: -1, stale: true }; }
-    const grow = round >= 2 ? Math.min(2, round - 1) : 0;       // 三轮还没清掉的：掩膜外扩再补
-    for (const cl of dots) { addDotStroke(cl, grow); added++; }
-  }
-  selfChecking = false;
-  return { added, left, base: STROKES.length - added };
+  $('stat').innerHTML = (cs.head || $('stat').innerHTML) + checkMsg;
 }
 
 // ---------------- 收尾与差异 ----------------
