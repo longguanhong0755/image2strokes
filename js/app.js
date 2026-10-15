@@ -17,6 +17,8 @@ let cumMs = null;              // 每笔结束时的累计时间（含抬笔移�
 let keys = [];                 // 关键帧快照 {i, data} 或 {i, rgb}（管线侧光栅）
 let keyEvery = 0;
 let KEYFRAMES = [];
+let selfChecking = false;         // 成品自检（找白点）进行中：期间 hud 不覆盖状态行
+let checkMsg = '';                // 自检结论（挂在状态行末尾，一直都在）
 // "像人在画"需要的三段时间轴：抬笔移动 travel + 换阶段停顿 beat + 落笔绘制 paint
 let travels = null, beats = null, msPaint = null;
 let targetMs = 240000;
@@ -92,7 +94,7 @@ function startExtract(imgCanvas) {
   };
   targetMs = opts.targetSec * 1000;
   if (!worker) {
-    worker = new Worker('js/worker.js');
+    worker = new Worker('js/worker.js?v=5');
     worker.onmessage = onWorker;
     worker.onerror = (e) => { $('status').textContent = '出错：' + e.message; };
   }
@@ -112,6 +114,7 @@ function onWorker(e) {
   KEYFRAMES = (d.res.keys || []).map((k) => ({ i: k.i, rgb: k.rgb }));
   buildCanvases();
   resetPlayback();
+  checkMsg = '';
   $('stage').style.display = 'none';
   $('canvasWrap').style.display = 'block';
   $('stat').innerHTML = '共 <em>' + STATS.strokes + '</em> 笔 · 约 <em>' +
@@ -119,8 +122,23 @@ function onWorker(e) {
     (STATS.photo ? ' · 已按照片自动用 <em>' + STATS.colors + '</em> 色' : (STATS.colors ? ' · ' + STATS.colors + ' 色' : ''));
   for (const id of ['expVideo', 'expJson', 'expPng']) { const b = $(id); if (b) b.disabled = false; }
   $('expMsg').textContent = '';
-  playing = true;
-  $('play').textContent = '暂停';
+  // 先做成品自检（白点归零再开播），完事自动开始
+  playing = false;
+  $('play').textContent = '开始';
+  const head = $('stat').innerHTML;
+  selfCheck().then((r) => {
+    if (r.stale) return;                 // 已被新一轮提炼取代
+    buildTimeline();
+    resetPlayback();
+    checkMsg = ' · 白点自检 <em>' + (r.left === 0 ? '0 个' : r.left + ' 个残留') + '</em>' +
+      (r.added ? '（补 ' + r.added + ' 笔）' : '');
+    $('stat').innerHTML = head + checkMsg;
+    playing = true;
+    $('play').textContent = '暂停';
+  }).catch(() => {                       // 自检出错也不能挡着画画
+    selfChecking = false; buildTimeline(); resetPlayback();
+    playing = true; $('play').textContent = '暂停';
+  });
 }
 
 // ---------------- 画布 ----------------
@@ -228,8 +246,17 @@ function paintStroke(i, u) {
   tmp.clearRect(rect.x, rect.y, rect.w, rect.h);
   tmp.save();
   tmp.fillStyle = rgb;
+  tmp.strokeStyle = rgb;
   if (u >= 1) {
-    tmp.fill(ribbonPath(st));                       // 整笔：笔形
+    // 整笔：先填笔形，再沿笔形描一圈同色细边（约 0.7px）。
+    // 这样抗锯齿产生的"半透明毛边"变成实心，两个色块相接处不会露出 1px 白缝
+    // ——白点的根源之一就是这个（详见 README 的坑）。
+    const pth = ribbonPath(st);
+    tmp.lineWidth = 1.4;
+    tmp.lineJoin = 'round';
+    tmp.lineCap = 'round';
+    tmp.fill(pth);
+    tmp.stroke(pth);
   } else {
     tmp.clip(ribbonPath(st));                       // 半成品：笔形 ∩ 已扫过的部分
     tmp.clip(leadPath(t, st));
@@ -312,6 +339,7 @@ function leadPath(t, st) {
 
 // ---------------- 播放循环 ----------------
 function flushMain() {
+  if (!mt || !painted) return;              // 还没选图、画布尚未建立
   mt.setTransform(1, 0, 0, 1, 0, 0);
   mt.fillStyle = '#ffffff';
   mt.fillRect(0, 0, W, H);
@@ -443,7 +471,7 @@ function snapshotKey(i) {
 }
 
 function hud() {
-  if (!STATS) return;
+  if (!STATS || selfChecking) return;
   const n = STROKES.length;
   const st = n ? STROKES[Math.min(idx, n - 1)] : null;
   const cur = done ? STATS.totalMs : (cumMs[idx] + acc);
@@ -454,7 +482,7 @@ function hud() {
   setPhase(ph);
   if (!done) {
     $('stat').innerHTML = '阶段 <em>' + (PHASES[ph] || '') + '</em> · 第 <em>' +
-      Math.min(idx + 1, n) + '</em> / ' + n + ' 笔 · ' + (p * 100).toFixed(0) + '%';
+      Math.min(idx + 1, n) + '</em> / ' + n + ' 笔 · ' + (p * 100).toFixed(0) + '%' + checkMsg;
   }
 }
 
@@ -529,6 +557,126 @@ function advanceTo(tgt) {
   }
 }
 
+// ---------------- 成品自检：空白点归零 ----------------
+// 管线是拿它自己的光栅模型判"白点"的；网页端是浏览器的抗锯齿多边形 + 1 位硬遮罩裁剪，
+// 两者在笔形边缘上会有细微出入。所以成品出来之后，在**真实画布**上再查一遍：
+// 该有颜色却还是白的像素，按连通块补一个"方点笔"（严格掩膜，只盖这几个像素），迭代到 0。
+// "算白"的两个门槛必须满足：原图门槛 ≤ 画布门槛。
+// 这样"把目标色画上去"一定能消掉白点（否则会出现补了还是白点的死循环）；
+// 同时画布门槛取得严一点（244），浅色区块不会被误判成白点而乱补。
+const WHITE_CANVAS = 244;          // 画布上"三通道都 ≥ 它"才算这点是白的
+const WHITE_TARGET = 228;          // 原图"三通道都 ≥ 它"就认为本来就白，不用管
+const isWhite = (r, g, b, t) => r >= t && g >= t && b >= t;
+function whiteDots() {
+  let im;
+  try { im = painted.getContext('2d').getImageData(0, 0, W, H).data; }
+  catch (e) { return []; }
+  const tgt = target.data;
+  const m = new Uint8Array(W * H);
+  let any = 0;
+  for (let p = 0; p < W * H; p++) {
+    const q = p * 4;
+    if (!isWhite(im[q], im[q + 1], im[q + 2], WHITE_CANVAS)) continue;   // 这里已经有颜色了
+    if (isWhite(tgt[q], tgt[q + 1], tgt[q + 2], WHITE_TARGET)) continue; // 原图本来就是白的
+    m[p] = 1; any++;
+  }
+  const out = [];
+  if (!any) return out;
+  const seen = new Uint8Array(W * H);
+  const q = new Int32Array(any);
+  for (let s = 0; s < W * H; s++) {
+    if (!m[s] || seen[s]) continue;
+    let head = 0, tail = 0, cnt = 0;
+    q[tail++] = s; seen[s] = 1;
+    let x0 = W, y0 = H, x1 = -1, y1 = -1;
+    while (head < tail) {
+      const p = q[head++]; cnt++;
+      const x = p % W, y = (p - x) / W;
+      if (x < x0) x0 = x; if (x > x1) x1 = x;
+      if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx, yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+          const pp = yy * W + xx;
+          if (!seen[pp] && m[pp]) { seen[pp] = 1; q[tail++] = pp; }
+        }
+      }
+    }
+    out.push({ x0, y0, x1, y1, n: cnt, pix: Array.prototype.slice.call(q.subarray(0, cnt)) });
+  }
+  out.sort((a, b) => b.n - a.n);
+  return out;
+}
+
+// 每个白点补一个"方点笔"：掩膜严格等于这一块，笔形外扩 1px（保证像素中心一定落在笔形里），
+// 颜色取目标图这一块的平均色。方框只被掩膜裁到那几个像素上，周围正确的像素不受影响。
+function addDotStroke(cl, grow) {
+  const tgt = target.data;
+  const g = grow || 0;                       // 顽固白点：一轮没补掉就把掩膜和笔形再外扩一圈
+  const x0 = Math.max(0, cl.x0 - g), y0 = Math.max(0, cl.y0 - g);
+  const x1 = Math.min(W - 1, cl.x1 + g), y1 = Math.min(H - 1, cl.y1 + g);
+  const w0 = x1 - x0 + 1, h0 = y1 - y0 + 1;
+  const mask = new Uint8Array(w0 * h0);
+  let cr = 0, cg = 0, cb = 0, cnt = 0;
+  for (const p of cl.pix) {
+    const x = p % W, y = (p - x) / W;
+    if (x < x0 || y < y0 || x > x1 || y > y1) continue;
+    mask[(y - y0) * w0 + (x - x0)] = 1;
+    cr += tgt[p * 4]; cg += tgt[p * 4 + 1]; cb += tgt[p * 4 + 2]; cnt++;
+  }
+  if (g) {                                   // 外扩的那些像素也纳入掩膜，颜色一起取
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const k = (y - y0) * w0 + (x - x0);
+        if (mask[k]) continue;
+        const q = (y * W + x) * 4;
+        if (isWhite(tgt[q], tgt[q + 1], tgt[q + 2], WHITE_TARGET)) continue;   // 该是白的地方不收
+        mask[k] = 1;
+        cr += tgt[q]; cg += tgt[q + 1]; cb += tgt[q + 2]; cnt++;
+      }
+    }
+  }
+  CLIPS.push({ x: x0, y: y0, w: w0, h: h0, mask });
+  const gx0 = x0 - 1, gy0 = y0 - 1, gx1 = x1 + 2, gy1 = y1 + 2;
+  const my = (gy0 + gy1) / 2;
+  STROKES.push({
+    rib: [gx0, gy0, gx1, gy0, gx1, gy1, gx0, gy1],
+    tp: [gx0, my, gx1, my],
+    w: Math.max(3, h0 + 2),
+    color: [Math.round(cr / cnt), Math.round(cg / cnt), Math.round(cb / cnt)],
+    pen: 0, c: CLIPS.length - 1, r: -1, ph: 3, ms: 260,
+  });
+  paintStroke(STROKES.length - 1, 1);
+}
+
+let selfCheckGen = 0;
+async function selfCheck() {
+  const gen = ++selfCheckGen;         // 又选了一张图时，上一轮自检要立刻让位
+  selfChecking = true;
+  for (let i = 0; i < STROKES.length; i++) {              // 先把整幅重画一遍（分片，界面不假死）
+    paintStroke(i, 1);
+    if ((i & 2047) === 2047) {
+      $('stat').textContent = '成品自检：重画一遍 ' + Math.round(i / STROKES.length * 100) + '%';
+      await new Promise((r) => setTimeout(r, 0));
+      if (gen !== selfCheckGen) { selfChecking = false; return { added: 0, left: -1, stale: true }; }
+    }
+  }
+  let added = 0, left = 0;
+  for (let round = 0; round < 8; round++) {
+    const dots = whiteDots();
+    left = dots.length;
+    if (!left) break;                                          // 扫到 0 个才收手
+    $('stat').textContent = '成品自检：补白点（第 ' + (round + 1) + ' 遍，' + left + ' 处）…';
+    await new Promise((r) => setTimeout(r, 0));
+    if (gen !== selfCheckGen) { selfChecking = false; return { added, left: -1, stale: true }; }
+    const grow = round >= 2 ? Math.min(2, round - 1) : 0;       // 三轮还没清掉的：掩膜外扩再补
+    for (const cl of dots) { addDotStroke(cl, grow); added++; }
+  }
+  selfChecking = false;
+  return { added, left, base: STROKES.length - added };
+}
+
 // ---------------- 收尾与差异 ----------------
 function diffVsTarget() {
   const a = painted.getContext('2d').getImageData(0, 0, W, H).data;
@@ -569,9 +717,11 @@ function finish() {
   $('play').textContent = '重播';
   setPhase(4);
   const d = diffVsTarget();
+  const dots = whiteDots().reduce((a, c) => a + c.n, 0);
   $('stat').innerHTML = '画完了 · <em>' + STROKES.length + '</em> 笔 · 整体差异（1/4 缩放）平均 <em>' +
     d.mean4.toFixed(2) + '/255</em>、可见差异 <em>' + d.bad4.toFixed(2) + '%</em>' +
-    ' · 逐像素细节差异平均 ' + d.mean.toFixed(2) + '、可见 ' + d.badPct.toFixed(2) + '%';
+    ' · 逐像素细节差异平均 ' + d.mean.toFixed(2) + '、可见 ' + d.badPct.toFixed(2) + '%' +
+    ' · 空白点 <em>' + dots + '</em> 个';
 }
 
 // ---------------- 导出 ----------------

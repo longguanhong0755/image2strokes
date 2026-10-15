@@ -497,10 +497,12 @@
     sketchMix: 0.45,        // 起稿色 = 局部目标色 与 铅笔灰 的混合比例
     bleedP: 0.22,           // 多少比例的铺色笔允许"画出界"，后面再被覆盖修回
     bleedR: 2,              // 出界的像素半径
+    featherRaster: false,   // 光栅口径：false = 硬边（和网页端一致）；true = 羽化（只用于对比实验）
     organic: true,          // 单笔形态人性化：弧线 + 手抖 + 宽窄起伏
     inkEarly: false,        // 调试开关：勾线层放到铺色之前（默认 "铺色 → 勾线收形"，见 README 的坑 4）
     holeFill: true,         // 收尾补漏：把"还是没画上"的小洞逐个补掉（残差补笔有"太小/太散不补"的门槛）
     holeT: 28,              // 补漏的判定阈值（单通道差）
+    holeWhite: 244,         // 画布上"三通道都 ≥ 它"才算这点是白的（原图判定用 holeWhite-16，更宽）
     holeMax: 420,           // 只补这么大的洞（像素数）；更大的块属于平涂风格化，补了会花
     holeSeg: 48,            // 补漏一笔画多长（越长笔数越省）
     // --- 交界过渡带（实测负收益，默认关；见 README 的坑 5）---
@@ -1234,9 +1236,6 @@
     if ((opts.residual && opts.residual.length) || opts.returnCanvas || opts.returnKeys) {
       const canvas = new Uint8Array(N * 3);
       canvas.fill(255);
-      // 几何覆盖图：像素是否被任何一笔的笔形真正盖到（不看羽化）。
-      // 羽化会把笔形边缘"糊"到相邻像素上，那只是光栅层的错觉，网页端是硬边裁剪，会露白点。
-      const cover = new Uint8Array(N);
       const raster = (ribArr, color, clipIdx) => {
         const cl = clips[clipIdx];
         let xmin = Infinity, ymin = Infinity, xmax = -Infinity, ymax = -Infinity;
@@ -1254,7 +1253,9 @@
         const pts = new Float64Array(np2 * 2);
         for (let i = 0; i < np2; i++) { pts[i * 2] = ribArr[i * 2] - xmin; pts[i * 2 + 1] = ribArr[i * 2 + 1] - ymin; }
         fillPoly(local, mw, mh, pts);
-        const soft = opts.hardRaster ? local : feather(local, mw, mh);   // 网页端是硬边裁剪，可用 hardRaster 对齐口径
+        // 光栅口径：网页端是"硬边裁剪"（画布多边形抗锯齿 × 1 位遮罩），所以这里默认也按硬边算，
+        // 否则羽化会把笔形边缘"糊"到相邻像素，补漏判定就会以为那里已经画上了（留白点的老坑）。
+        const soft = opts.featherRaster ? feather(local, mw, mh) : local;
         for (let y = 0; y < mh; y++) {
           const yy = ymin + y;
           const rowC = (yy - cl.y) * cl.w;
@@ -1264,7 +1265,6 @@
             const xx = xmin + x;
             if (!cl.mask[rowC + (xx - cl.x)]) continue;
             const pp = yy * W + xx;
-            cover[pp] = 1;
             if (al >= 0.995) {
               canvas[pp * 3] = color[0]; canvas[pp * 3 + 1] = color[1]; canvas[pp * 3 + 2] = color[2];
             } else {
@@ -1500,7 +1500,6 @@
       //      A) 真空白——画布上这块还是白的（什么都没画到），而原图不是白的；不论大小都补
       //      B) 剩余的"小块/细条"错误——用厚度判定，大而厚的块仍跳过（那是平涂风格化本身）
       if (opts.holeFill) {
-        const thrH = clamp(opts.holeT * strokeScale, 16, 72);
         const errAt = (i) => Math.max(Math.abs(canvas[i * 3] - R[i]),
                                       Math.abs(canvas[i * 3 + 1] - G[i]),
                                       Math.abs(canvas[i * 3 + 2] - B[i]));
@@ -1550,13 +1549,39 @@
             }
             emitRaster(poly, [cx0, cy0], 1, rad, col, 0, cIdx, 3);
           }
+          // 自检：沿骨架走的笔形在细缝/拐角/极扁的形状上可能盖不到像素中心（画了等于没画）。
+          // 对"自检后仍然是白的"那些像素，用方点笔形（严格掩膜）兜底——方框一定包含像素中心。
+          const left = [];
+          for (let k = 0; k < comp.count; k++) {
+            const p = comps2.pix[comp.start + k];
+            const mn = Math.min(canvas[p * 3], canvas[p * 3 + 1], canvas[p * 3 + 2]);
+            if (mn >= opts.holeWhite) left.push(p);
+          }
+          if (left.length) {
+            let lx0 = W, ly0 = H, lx1 = -1, ly1 = -1, lr = 0, lg = 0, lb = 0;
+            for (const p of left) {
+              const x = p % W, y = (p - x) / W;
+              if (x < lx0) lx0 = x; if (x > lx1) lx1 = x;
+              if (y < ly0) ly0 = y; if (y > ly1) ly1 = y;
+              lr += R[p]; lg += G[p]; lb += B[p];
+            }
+            const lcol = [Math.round(lr / left.length), Math.round(lg / left.length), Math.round(lb / left.length)];
+            const lw = lx1 - lx0 + 1, lh = ly1 - ly0 + 1;
+            const b2 = new Uint8Array(lw * lh);
+            for (const p of left) { const x = p % W, y = (p - x) / W; b2[(y - ly0) * lw + (x - lx0)] = 1; }
+            const cIdx2 = pushClip(lx0, ly0, lw, lh, b2);
+            const gx0 = lx0 - 1, gy0 = ly0 - 1, gx1 = lx1 + 2, gy1 = ly1 + 2;   // 外扩 1px，保证像素中心在框内
+            const rect = [gx0, gy0, gx1, gy0, gx1, gy1, gx0, gy1];
+            emitRaster(rect, [gx0, (gy0 + gy1) / 2, gx1, (gy0 + gy1) / 2], 2,
+                       Math.max(1.6, lh / 2 + 1), lcol, 0, cIdx2, 3);
+          }
         };
         const fillMask = (mask, limit, maxAdd) => {
           const base = strokes.length;
           const cc2 = compsOfLabels(mask, W, H);
           const list = [];
           for (let ci = 0; ci < cc2.comps.length; ci++) if (cc2.comps[ci].label === 1) list.push(ci);
-          list.sort((a, b) => cc2.comps[b].count - cc2.comps[a].count);
+          list.sort((a, b) => cc2.comps[b].count - cc2.comps[a].count);   // 先补大块（同预算下总误差降得多）
           let n = 0;
           for (const ci of list.slice(0, limit)) {
             if (maxAdd && strokes.length - base >= maxAdd) break;
@@ -1564,19 +1589,26 @@
           }
           return n;
         };
-        // A) 真空白：这块**没有任何一笔的笔形盖到**（看几何覆盖，不看羽化）。
-        //    网页端是硬边裁剪，羽化的"盖到一点"在那边会发白，所以按几何判定最准。
-        //    只补"原图不是白的"地方，免得把干净的白底也补一遍。
+        // A) 真白点：**画布上这块还是白的**（没人画上去），而原图明显不是白的。
+        //    以前按"几何上有没有笔盖到"判定，问题是照片里"没盖到"的像素成千上万，
+        //    而补漏是按连通块从大到小取的，真正刺眼的 1~2px 白点排在最后，被数量门槛丢掉。
+        //    改成"画布看着白 + 原图不该白"（肉眼口径），并迭代到收敛。
         let nA = 0;
-        {
+        for (let roundA = 0; roundA < 3; roundA++) {
           const m = new Uint8Array(N);
           let any = 0;
           for (let i = 0; i < N; i++) {
-            if (cover[i]) continue;
-            const dW = Math.max(255 - R[i], 255 - G[i], 255 - B[i]);
-            if (dW > thrH) { m[i] = 1; any++; }
+            // 画布用 holeWhite（严），原图用 holeWhite-16（宽）——必须"原图门槛 ≤ 画布门槛"，
+            // 否则把目标色补上去之后这点仍然算白，会反复补、补不掉。
+            if (Math.min(canvas[i * 3], canvas[i * 3 + 1], canvas[i * 3 + 2]) < opts.holeWhite) continue;
+            if (Math.min(R[i], G[i], B[i]) >= opts.holeWhite - 16) continue;   // 原图这里本来就是白的
+            m[i] = 1; any++;
           }
-          if (any) nA = fillMask(m, 3000, 0);
+          if (!any) break;
+          const got = fillMask(m, 20000, 12000);
+          nA += got;
+          if (!got) break;
+          await yieldUI();
         }
         // B) 剩余的小块/细条错误（A 补完后重新算，已经补上的不再重复）。
         //    这里的阈值放宽一倍：照片这类纹理区里，一小块错误用的是一个均值色，
