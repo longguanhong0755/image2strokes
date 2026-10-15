@@ -578,7 +578,8 @@
       // 色数提上去、笔更细、允许更多笔，不然平涂会把纹理糊成一格一格的色块。
       if (texFrac > 0.06) {
         opts.photoMode = true;
-        if (!opts.colors && opts.autoColors) opts.colors = texFrac > 0.14 ? 36 : 32;
+        // 实测（照片样张）：40 色比 32 色可见差异 35.03% → 34.63%，笔数还略少；再往上加轮数没收益
+        if (!opts.colors && opts.autoColors) opts.colors = texFrac > 0.14 ? 44 : 40;
         if (opts.maxStrokes === CFG.maxStrokes) opts.maxStrokes = 26000;
         if (opts.minArea === CFG.minArea) opts.minArea = texFrac > 0.14 ? 90 : 110;
         if (opts.bwF === CFG.bwF) { opts.bwF = 0.12; opts.bwMin = 7; }

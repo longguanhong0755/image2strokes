@@ -96,7 +96,7 @@ function startExtract(imgCanvas) {
   };
   targetMs = opts.targetSec * 1000;
   if (!worker) {
-    worker = new Worker('js/worker.js?v=7');
+    worker = new Worker('js/worker.js?v=8');
     worker.onmessage = onWorker;
     worker.onerror = (e) => { $('status').textContent = '出错：' + e.message; };
   }
