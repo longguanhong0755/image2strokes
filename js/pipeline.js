@@ -91,6 +91,75 @@
     }
   }
 
+  // ---------------- 覆盖率光栅（非零环绕 + 亚扫描线 + x 向精确积分） ----------------
+  // 网页端画的是"画布多边形（抗锯齿）∩ 1 位遮罩"：一个像素只被笔形斜斜擦过 20%，
+  // 网页端看起来还是半白的。管线要用同一口径判断"这一笔画上了没有"——否则会出现
+  // "管线以为画上了、网页端仍是白点"的错配（光栅用偶奇二值就漏掉这一类）。
+  // 返回每个像素被盖住的比例 0..1（累加写进 out，调用方负责清零）。
+  function fillPolyCov(out, mw, mh, pts, subY) {
+    const n = pts.length >> 1;
+    if (n < 3) return;
+    let ymin = Infinity, ymax = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const y = pts[i * 2 + 1];
+      if (y < ymin) ymin = y; if (y > ymax) ymax = y;
+    }
+    ymin = Math.max(0, Math.floor(ymin)); ymax = Math.min(mh - 1, Math.ceil(ymax));
+    const S = subY || 2;
+    const wgt = 1 / S;
+    const xs = new Float64Array(n + 1), dr = new Int8Array(n + 1), sub = new Int32Array(n + 1);
+    for (let y = ymin; y <= ymax; y++) {
+      const row = y * mw;
+      for (let sy = 0; sy < S; sy++) {
+        const yc = y + (sy + 0.5) / S;
+        let m = 0;
+        for (let i = 0; i < n; i++) {
+          const x0 = pts[i * 2], yy0 = pts[i * 2 + 1];
+          const j = (i + 1) % n;
+          const x1 = pts[j * 2], yy1 = pts[j * 2 + 1];
+          if ((yy0 <= yc && yy1 > yc) || (yy1 <= yc && yy0 > yc)) {
+            xs[m] = x0 + (yc - yy0) / (yy1 - yy0) * (x1 - x0);
+            dr[m] = yy1 > yy0 ? 1 : -1;
+            m++;
+          }
+        }
+        if (m < 2) continue;
+        if (m === 2) {                       // 常见情形（扫描线只穿两条边）：连排序都省了
+          if (xs[0] > xs[1]) {
+            const tx = xs[0]; xs[0] = xs[1]; xs[1] = tx;
+            const td = dr[0]; dr[0] = dr[1]; dr[1] = td;
+          }
+          sub[0] = 0; sub[1] = 1;
+        } else {                             // 行内交点很少：插入排序，比 slice+sort 省掉每行一次的分配
+          for (let k = 0; k < m; k++) {
+            const v = xs[k];
+            let j2 = k - 1;
+            while (j2 >= 0 && xs[sub[j2]] > v) { sub[j2 + 1] = sub[j2]; j2--; }
+            sub[j2 + 1] = k;
+          }
+        }
+        let wind = 0, startX = 0;
+        for (let k = 0; k < m; k++) {
+          const kk = sub[k];
+          const prev = wind;
+          wind += dr[kk];
+          if (prev === 0 && wind !== 0) startX = xs[kk];
+          else if (prev !== 0 && wind === 0) {
+            let xa = startX, xb = xs[kk];
+            if (xb <= 0 || xa >= mw) continue;
+            if (xa < 0) xa = 0;
+            if (xb > mw) xb = mw;
+            const ia = Math.floor(xa), ib = Math.floor(xb);
+            if (ia === ib) { out[row + ia] += (xb - xa) * wgt; continue; }
+            out[row + ia] += (ia + 1 - xa) * wgt;
+            for (let x = ia + 1; x < ib; x++) out[row + x] += wgt;
+            if (ib < mw) out[row + ib] += (xb - ib) * wgt;
+          }
+        }
+      }
+    }
+  }
+
   // ---------------- 距离变换（3×4 chamfer，近似欧氏） ----------------
   function distanceTransform(bin, w, h) {
     const INF = 1e9;
@@ -506,6 +575,12 @@
     holePaper: 254,         // "纸面根本没涂上"门槛（三通道都 ≥ 它 = 那像素还是白纸），原图比它深 8 以上就补
     holeMax: 420,           // 只补这么大的洞（像素数）；更大的块属于平涂风格化，补了会花
     holeSeg: 48,            // 补漏一笔画多长（越长笔数越省）
+    holeBatchMax: 200,      // 小于这么大的洞并进"补丁笔"（掩膜互不相交 ⇒ 合并像素等价，笔数省）
+    patchShift: 3,          // 补笔合并的颜色分桶位移（3 = 每桶 8 个色阶）：同格同桶的散点合成一笔
+    coverMin: 0.7,          // 光栅判"这一笔画上了"所需的覆盖率（网页端半透明毛边按没画上算）
+    coverSubY: 2,           // 覆盖率用的亚扫描线数（1 = 只看像素中线，够抓白点且更快）
+    patchCell: 2048,        // 补笔合并的空间格子（像素）；远大于图幅 = 不分格，只靠 patchShift/patchBox 控制
+    patchBox: 128,          // 合并后一笔的外框上限（像素）：外框越大，网页端每笔要清/合的画布越大、内存越费
     // --- 交界过渡带（实测负收益，默认关；见 README 的坑 5）---
     edgeFill: false,        // 沿色块交界补"中间色"细笔：边界像素在目标图里大多本来就是纯色，补了反而更差
     edgeT: 10,              // 交界过渡带的阈值（单通道差）
@@ -1250,19 +1325,21 @@
         xmax = Math.min(cl.x + cl.w - 1, Math.ceil(xmax)); ymax = Math.min(cl.y + cl.h - 1, Math.ceil(ymax));
         if (xmax < xmin || ymax < ymin) return;
         const mw = xmax - xmin + 1, mh = ymax - ymin + 1;
-        const local = new Uint8Array(mw * mh);
         const np2 = ribArr.length >> 1;
         const pts = new Float64Array(np2 * 2);
         for (let i = 0; i < np2; i++) { pts[i * 2] = ribArr[i * 2] - xmin; pts[i * 2 + 1] = ribArr[i * 2 + 1] - ymin; }
-        fillPoly(local, mw, mh, pts);
-        // 光栅口径：网页端是"硬边裁剪"（画布多边形抗锯齿 × 1 位遮罩），所以这里默认也按硬边算，
-        // 否则羽化会把笔形边缘"糊"到相邻像素，补漏判定就会以为那里已经画上了（留白点的老坑）。
-        const soft = opts.featherRaster ? feather(local, mw, mh) : local;
+        // 光栅口径（老坑，见 README）：网页端是"画布多边形抗锯齿 ∩ 1 位硬遮罩"，
+        // 所以这里也按覆盖率算——盖不到 coverMin 的像素就当"没画上"（保守），
+        // 宁可让下一轮补笔/补漏把它补实，也不能让网页端留个半白的点。
+        const cov = new Float32Array(mw * mh);
+        fillPolyCov(cov, mw, mh, pts, opts.coverSubY || 1);
         for (let y = 0; y < mh; y++) {
           const yy = ymin + y;
           const rowC = (yy - cl.y) * cl.w;
           for (let x = 0; x < mw; x++) {
-            const al = soft[y * mw + x];
+            let al = cov[y * mw + x];
+            if (al <= 0) continue;
+            if (!opts.featherRaster) al = al >= opts.coverMin ? 1 : 0;
             if (al <= 0) continue;
             const xx = xmin + x;
             if (!cl.mask[rowC + (xx - cl.x)]) continue;
@@ -1288,19 +1365,114 @@
       if (!keysOut.length || keysOut[keysOut.length - 1].i !== strokes.length) {
         keysOut.push({ i: strokes.length, rgb: canvas.slice() });
       }
-      const emitRaster = (rib, pathPts, nPath, halfW, col, pen, cIdx, ph) => {
+      // 按"产出站点"计数（诊断用：哪一段在刷笔数）
+      const SRC = { batch: 0, resRibbon: 0, holeRibbon: 0, holeDab: 0, holeRect: 0 };
+      dbg.rounds = [];
+      dbg.src = SRC;
+      // 外框笔形一定盖满自己的掩膜 ⇒ 直接按掩膜落色（等价，省掉在一整块大外框上跑覆盖光栅）
+      const rasterMask = (clipIdx, color) => {
+        const cl = clips[clipIdx];
+        for (let y = 0; y < cl.h; y++) {
+          const rowC = y * cl.w, row = (cl.y + y) * W;
+          for (let x = 0; x < cl.w; x++) {
+            if (!cl.mask[rowC + x]) continue;
+            const pp = row + cl.x + x;
+            canvas[pp * 3] = color[0]; canvas[pp * 3 + 1] = color[1]; canvas[pp * 3 + 2] = color[2];
+          }
+        }
+      };
+      const emitRaster = (rib, pathPts, nPath, halfW, col, pen, cIdx, ph, maskOnly) => {
         const rec = emitStroke(rib, rib.length / 2, pathPts, nPath, halfW, col, pen, cIdx, -1, ph);
-        raster(rec.rib, rec.color, rec.c);
+        dbg.src[dbg.srcSite || 'holeDab']++;
+        if (maskOnly) rasterMask(rec.c, rec.color);
+        else raster(rec.rib, rec.color, rec.c);
         return rec;
       };
       const TILE = 72;
+      // ---- 补丁合并池（残差补笔、收尾补漏共用）：笔数从几万降到几千的主要手段 ----
+      // 补笔里绝大多数是 5~16px 的"小点"，一拍一笔，照片类能拍出两万个单点笔。
+      // 但每一笔的笔形最终都会被它自己的 1 位裁剪掩膜裁掉多余部分 —— 也就是
+      // "笔形只要盖住自己的掩膜"就够。于是把"同一格、颜色同一个桶"的补丁并成一笔：
+      // 掩膜取并集、笔形取并集外框（再外扩 0.5px 保证盖住每个像素中心）、颜色取桶内加权均值。
+      // 各补丁的掩膜互不相交 ⇒ 谁也没盖住谁 ⇒ 合并只带来"每通道 ≤ 半个桶宽"的取色偏差，
+      // 换来笔数少一个数量级（桶宽可调：patchShift；空间粒度：patchCell）。
+      const CEL = Math.max(16, opts.patchCell | 0);
+      const makePool = () => {
+        const pool = new Map();
+        let nOut = 0, nIn = 0, maxG = 0;
+        const flushGroup = (g, ph) => {
+          const mw = g.x1 - g.x0 + 1, mh = g.y1 - g.y0 + 1;
+          const m = new Uint8Array(mw * mh);
+          for (const p of g.parts) {
+            for (let y = 0; y < p.h; y++) {
+              const src = y * p.w, dst = (p.y - g.y0 + y) * mw + (p.x - g.x0);
+              for (let x = 0; x < p.w; x++) if (p.m[src + x]) m[dst + x] = 1;
+            }
+          }
+          const cIdx = pushClip(g.x0, g.y0, mw, mh, m);
+          const ex0 = g.x0 - 0.5, ey0 = g.y0 - 0.5, ex1 = g.x1 + 1.5, ey1 = g.y1 + 1.5;
+          const rect = [ex0, ey0, ex1, ey0, ex1, ey1, ex0, ey1];
+          // 笔尖轨迹：按"就近串"把这一组点连起来，回放时看着像手在一个地方点点
+          const n = g.px.length;
+          const ord = n >= 3 ? chainNN(g.px.map((_, i) => i), (i) => [g.px[i], g.py[i]], g.px[0], g.py[0]) : null;
+          const tp = [];
+          for (let k = 0; k < n; k++) { const i = ord ? ord[k] : k; tp.push(g.px[i], g.py[i]); }
+          const col = [Math.round(g.cr / g.cn), Math.round(g.cg / g.cn), Math.round(g.cb / g.cn)];
+          dbg.srcSite = 'batch';
+          const rec = emitRaster(rect, tp, n, 4.2, col, 0, cIdx, ph, true);
+          rec.g = n;                      // 这一笔合了几个补丁（诊断用）
+          nOut++;
+        };
+        return {
+          add(col, x0, y0, x1, y1, mw, mh, mask, cx, cy, cnt) {
+            const sh = opts.patchShift;
+            const key = (((y0 / CEL) | 0) * 4096 + ((x0 / CEL) | 0)) + '|' +
+                        (col[0] >> sh) + ',' + (col[1] >> sh) + ',' + (col[2] >> sh);
+            let list = pool.get(key);
+            if (!list) { list = []; pool.set(key, list); }
+            // 同一格同一色桶可以有好几组：谁的外框装得下这个补丁就并进谁
+            // （外框越大 → 网页端每一笔要清/合的画布越大、裁剪掩膜内存越费，所以要设上限）
+            const BX = opts.patchBox;
+            let g = null;
+            for (let li = 0; li < list.length; li++) {
+              const gg = list[li];
+              if (Math.max(gg.x1, x1) - Math.min(gg.x0, x0) + 1 <= BX &&
+                  Math.max(gg.y1, y1) - Math.min(gg.y0, y0) + 1 <= BX) { g = gg; break; }
+            }
+            if (!g) { g = { cr: 0, cg: 0, cb: 0, cn: 0, x0, y0, x1, y1, parts: [], px: [], py: [] }; list.push(g); }
+            if (x0 < g.x0) g.x0 = x0; if (y0 < g.y0) g.y0 = y0;
+            if (x1 > g.x1) g.x1 = x1; if (y1 > g.y1) g.y1 = y1;
+            g.cr += col[0] * cnt; g.cg += col[1] * cnt; g.cb += col[2] * cnt; g.cn += cnt;
+            g.parts.push({ x: x0, y: y0, w: mw, h: mh, m: mask });
+            g.px.push(cx); g.py.push(cy);
+            if (g.parts.length > maxG) maxG = g.parts.length;
+            nIn++;
+            // 一组别太大：回放更细、就近串也不至于变慢
+            if (g.parts.length >= 360) { flushGroup(g, this._ph); list.splice(list.indexOf(g), 1); }
+          },
+          flush(ph) {
+            this._ph = ph;
+            for (const list of pool.values()) for (const g of list) if (g.parts.length) flushGroup(g, ph);
+            pool.clear();
+            return nOut;
+          },
+          stat() { return { out: nOut, in: nIn, maxG }; },
+        };
+      };
       let prevPct = 999;
+      let nPieces = strokes.length;   // 轮次预算按"补丁个数"算（起算点 = 补笔前已有的笔数）：
+                             // 合并成笔后笔数会变少，若按笔数算，合并本身会让补笔多跑一轮，
+                             // 质量变好但耗时变长——那属于另一件事，不该被"省笔"顺手带出来
       for (let round = 0; round < opts.residual.length; round++) {
-        if (strokes.length > opts.maxStrokes) break;
+        if (nPieces > opts.maxStrokes) break;
         // 前两轮是"收形"（把轮廓/边缘修准），后面几轮是"点睛"（抠细节，手更慢更细）
         const phR = round < 2 ? 2 : 3;
         const thr = opts.residual[round];
         let added = 0;
+        const pool = makePool();
+        const addPatch = pool.add;
+        const flushBatch = () => { pool.flush(phR); };
+        const nBatch = () => pool.stat().out;
         // 全图错误掩膜：把"又大又厚"的错误块（大片平滑渐变差异）排除在补笔之外，
         // 否则会按 72px 小格补出块状拼贴
         const skip = new Uint8Array(N);
@@ -1416,19 +1588,13 @@
                   bin[(toY(pcc.pix[st + k]) - by) * mw + (toX(pcc.pix[st + k]) - bx)] = 1;
                 }
                 const clipMask = dilate(bin, mw, mh, pad);
-                const cIdx = pushClip(bx, by, mw, mh, clipMask);
                 const cx0 = (x0 + x1) / 2, cy0 = (y0 + y1) / 2;
-                if (cnt <= 16) {                       // 小点：一笔点掉
-                  const rad = clamp(Math.sqrt(cnt / Math.PI) + 1.4, 2.0, 12);
-                  const poly = [];
-                  for (let k = 0; k < 13; k++) {
-                    const a = k / 13 * Math.PI * 2;
-                    poly.push(cx0 + rad * Math.cos(a), cy0 + rad * Math.sin(a));
-                  }
-                  emitRaster(poly, [cx0, cy0], 1, rad, col, 0, cIdx, phR);
+                if (cnt <= 16) {                       // 小点：并进"同色同格"的补丁笔（见 addPatch）
+                  addPatch(col, bx, by, bx1, by1, mw, mh, bin, cx0, cy0, cnt);
                   added++;
                   continue;
                 }
+                const cIdx = pushClip(bx, by, mw, mh, clipMask);
                 const dt = distanceTransform(bin, mw, mh);
                 const dvals = Array.from(dt).sort((a, b) => a - b);
                 const dmed = dvals[dvals.length >> 1];
@@ -1463,34 +1629,33 @@
                       const arr2 = Float64Array.from(pts2);
                       if (arr2.length >= 4) {
                         const rb = ribbon(arr2, arr2.length / 2, half);
+                        dbg.srcSite = 'resRibbon';
                         emitRaster(rb, arr2, arr2.length / 2, half, cols[i2] || col, 0, cIdx, phR);
                         added++;
                       }
                       i2 = j2 + 1;
                     }
                   }
-                } else {
-                  const rad = clamp(Math.sqrt(cnt / Math.PI) + 0.8, 2.0, 10);
-                  const poly = [];
-                  for (let k = 0; k < 13; k++) {
-                    const a = k / 13 * Math.PI * 2;
-                    poly.push(cx0 + rad * Math.cos(a), cy0 + rad * Math.sin(a));
-                  }
-                  emitRaster(poly, [cx0, cy0], 1, rad, col, 0, cIdx, phR);
+                } else {                               // 没有骨架（奇形怪状的小块）：也并进补丁笔
+                  addPatch(col, bx, by, bx1, by1, mw, mh, clipMask, cx0, cy0, cnt);
                   added++;
                 }
               }
             }
           }
         }
+        flushBatch();          // 本轮攒下的补丁笔在这里落盘（像素结果与逐个补一致，只差半个色阶）
+        nPieces += added;
         let bad = 0;
         for (let i = 0; i < N; i++) {
           const d = Math.max(Math.abs(canvas[i * 3] - R[i]), Math.abs(canvas[i * 3 + 1] - G[i]), Math.abs(canvas[i * 3 + 2] - B[i]));
           if (d > 8) bad++;
         }
         const pct = bad / N * 100;
+        if (dbg.rounds) dbg.rounds.push({ r: round, thr, 补丁: added, 笔: nBatch(), 差异: +pct.toFixed(2) });
         prog(0.78 + 0.2 * (round + 1) / opts.residual.length,
-             (phR === 2 ? "收形补笔…" : "点睛补细节…") + " 第 " + (round + 1) + " 轮（可见差异 " + pct.toFixed(2) + "%）");
+             (phR === 2 ? "收形补笔…" : "点睛补细节…") + " 第 " + (round + 1) + " 轮（" +
+             nBatch() + " 笔，可见差异 " + pct.toFixed(2) + "%）");
         if (pct < 1.0) break;
         if (opts.resStop > 0 && prevPct - pct < opts.resStop && round >= 1) break;   // 收益变小就收手
         prevPct = pct;
@@ -1505,7 +1670,8 @@
         const errAt = (i) => Math.max(Math.abs(canvas[i * 3] - R[i]),
                                       Math.abs(canvas[i * 3 + 1] - G[i]),
                                       Math.abs(canvas[i * 3 + 2] - B[i]));
-        // 补一个连通块：贴着它的形状走一条（或几条）笔
+        const hp = makePool();
+        // 补一个连通块：大洞贴着它的形状走一条（或几条）笔，小洞并进补丁笔（见 hp.add）
         const fillComp = (comp, comps2) => {
           const x0 = comp.x0, y0 = comp.y0, x1 = comp.x1, y1 = comp.y1;
           const mw = x1 - x0 + 1, mh = y1 - y0 + 1;
@@ -1518,6 +1684,12 @@
             cr += R[p]; cg += G[p]; cb += B[p];
           }
           const col = [Math.round(cr / comp.count), Math.round(cg / comp.count), Math.round(cb / comp.count)];
+          // 小洞并进补丁笔：掩膜取并集、笔形取并集外框（外扩 0.5px）—— 一定盖满自己的掩膜，
+          // 所以比"沿骨架走一笔"更稳（骨架笔在细缝/拐角会盖不到像素中心，那正是白点的老坑）。
+          if (comp.count <= opts.holeBatchMax) {
+            hp.add(col, x0, y0, x1, y1, mw, mh, bin, (x0 + x1) / 2, (y0 + y1) / 2, comp.count);
+            return;
+          }
           // 严格只覆盖"确实画错/没画"的那些像素，不外扩——否则会把周围本来正确的像素也刷成均值色
           const cIdx = pushClip(x0, y0, mw, mh, bin);
           const dt = distanceTransform(bin, mw, mh);
@@ -1539,6 +1711,7 @@
               if (sg.n < 2) continue;
               const rb = ribbon(sg.pts, sg.n, half);
               const cSeg = sampleColor(rb, rb.length / 2, bin, x0, y0, mw, mh) || col;
+              dbg.srcSite = 'holeRibbon';
               emitRaster(rb, sg.pts, sg.n, half, cSeg, cSeg[0] < 120 ? 1 : 0, cIdx, 3);
             }
           } else {
@@ -1549,6 +1722,7 @@
               const a = k / 13 * Math.PI * 2;
               poly.push(cx0 + rad * Math.cos(a), cy0 + rad * Math.sin(a));
             }
+            dbg.srcSite = 'holeDab';
             emitRaster(poly, [cx0, cy0], 1, rad, col, 0, cIdx, 3);
           }
           // 自检：沿骨架走的笔形在细缝/拐角/极扁的形状上可能盖不到像素中心（画了等于没画）。
@@ -1574,6 +1748,7 @@
             const cIdx2 = pushClip(lx0, ly0, lw, lh, b2);
             const gx0 = lx0 - 1, gy0 = ly0 - 1, gx1 = lx1 + 2, gy1 = ly1 + 2;   // 外扩 1px，保证像素中心在框内
             const rect = [gx0, gy0, gx1, gy0, gx1, gy1, gx0, gy1];
+            dbg.srcSite = 'holeRect';
             emitRaster(rect, [gx0, (gy0 + gy1) / 2, gx1, (gy0 + gy1) / 2], 2,
                        Math.max(1.6, lh / 2 + 1), lcol, 0, cIdx2, 3);
           }
@@ -1614,6 +1789,7 @@
           if (!any) break;
           const got = fillMask(m, 20000, 12000);
           nA += got;
+          hp.flush(3);            // 本轮并起来的补丁笔在这里落笔（下一轮重扫白点前必须落完）
           if (!got) break;
           await yieldUI();
         }
@@ -1636,6 +1812,7 @@
             }
           }
           nB = fillMask(m, 2500, 4200);
+          hp.flush(3);
         }
         // C) 交界过渡带：两个色块硬碰硬的地方，目标图那一两像素是混色，
         //    我们画的是纯色，差值就是"可见差异"的主要来源——沿交界补上目标色本身
@@ -1666,7 +1843,7 @@
           const m = new Uint8Array(N);
           let any = 0;
           for (let i = 0; i < N; i++) if (band[i] && errAt(i) > thrC) { m[i] = 1; any++; }
-          if (any) nC = fillMask(m, opts.edgeMax, 4200);
+          if (any) { nC = fillMask(m, opts.edgeMax, 4200); hp.flush(3); }
         }
         if (nA || nB || nC) {
           let bad2 = 0;

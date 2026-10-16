@@ -70,6 +70,31 @@ function fillPoly(mask, mw, mh, pts) {
   }
 }
 
+// 顶点法线外扩（模拟网页端那一记 lineWidth 1.4 的同色描边：笔形实际覆盖 = 填充 ∪ 边界外扩 0.7px）
+function offsetOut(pts, n, d) {
+  const out = new Float64Array(n * 2);
+  for (let i = 0; i < n; i++) {
+    const px0 = pts[i * 2], py0 = pts[i * 2 + 1];
+    const j = (i + 1) % n, k = (i - 1 + n) % n;
+    const ax = pts[j * 2] - px0, ay = pts[j * 2 + 1] - py0;
+    const bx = px0 - pts[k * 2], by = py0 - pts[k * 2 + 1];
+    const la = Math.hypot(ax, ay) || 1, lb = Math.hypot(bx, by) || 1;
+    let mx = -ay / la - by / lb, my = ax / la + bx / lb;
+    const lm = Math.hypot(mx, my) || 1;
+    out[i * 2] = px0 + mx / lm * d;
+    out[i * 2 + 1] = py0 + my / lm * d;
+  }
+  return out;
+}
+function areaOf(pts, n) {
+  let a = 0;
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    a += pts[i * 2] * pts[j * 2 + 1] - pts[j * 2] * pts[i * 2 + 1];
+  }
+  return Math.abs(a) / 2;
+}
+
 // SUB×SUB 个亚像素偏移（像素内 (2k+1)/(2·SUB) 位置）
 const OFF = [];
 for (let k = 0; k < SUB; k++) OFF.push((2 * k + 1) / (2 * SUB) - 0.5);
@@ -79,6 +104,7 @@ const cov = new Float32Array(w * h);          // 累计不透明度（1 - Π(1-a
 let lastStroke = new Int32Array(w * h).fill(-1);   // 最后一笔"明显盖上"（a≥0.4）的笔号
 const realloc = () => { lastStroke = new Int32Array(w * h).fill(-1); };
 const pts = [];                      // 复用的点缓存
+const ptsO = [];                     // 描边外扩后的点缓存
 const t1 = Date.now();
 let area = 0;
 for (let si = 0; si < strokes.length; si++) {
@@ -97,6 +123,15 @@ for (let si = 0; si < strokes.length; si++) {
   if (xmax < xmin || ymax < ymin) continue;
   const mw = xmax - xmin + 1, mh = ymax - ymin + 1;
   const acc = new Float32Array(mw * mh);
+  // 网页端每一笔都是"先填笔形、再沿笔形描一圈同色细边（1.4px）"，
+  // 所以实际覆盖 = 笔形 ∪ 外扩 0.7px。不模拟这一步会把"边缘擦过"误报成白点。
+  const ribOff = np >= 3 ? (() => {
+    const a1 = offsetOut(rib, np, 0.7), a2 = offsetOut(rib, np, -0.7);
+    const o = areaOf(a1, np) >= areaOf(a2, np) ? a1 : a2;   // 面积变大的一侧才是朝外
+    const arr = new Float64Array(np * 2);
+    for (let i = 0; i < np; i++) { arr[i * 2] = o[i * 2] - xmin; arr[i * 2 + 1] = o[i * 2 + 1] - ymin; }
+    return arr;
+  })() : null;
   for (let oi = 0; oi < OFF.length; oi++) {
     for (let oj = 0; oj < OFF.length; oj++) {
       const sx = OFF[oi], sy = OFF[oj];
@@ -104,6 +139,13 @@ for (let si = 0; si < strokes.length; si++) {
       for (let i = 0; i < np; i++) { pts.push(rib[i * 2] - xmin + sx, rib[i * 2 + 1] - ymin + sy); }
       const bin = new Uint8Array(mw * mh);
       fillPoly(bin, mw, mh, pts);
+      if (ribOff) {                       // 同色描边：把笔形外扩 0.7px 一起算进去
+        const off = new Uint8Array(mw * mh);
+        ptsO.length = 0;
+        for (let i = 0; i < np; i++) ptsO.push(ribOff[i * 2] + sx, ribOff[i * 2 + 1] + sy);
+        fillPoly(off, mw, mh, ptsO);
+        for (let k = 0; k < acc.length; k++) if (off[k]) bin[k] = 1;
+      }
       const wgt = 1 / (OFF.length * OFF.length);
       for (let k = 0; k < acc.length; k++) if (bin[k]) acc[k] += wgt;
     }
