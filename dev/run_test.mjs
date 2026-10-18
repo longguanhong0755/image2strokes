@@ -43,7 +43,8 @@ console.log(`[dbg] 主笔 ${res.dbg.mainStrokes}  残差笔 ${res.stats.strokes 
 console.log(`[test] 用时 ${dt.toFixed(1)}s  区块 ${res.stats.regions}  线稿组 ${res.stats.inkGroups}  总笔数 ${res.stats.strokes}  ` +
             `总时长 ${(res.stats.totalMs / 1000).toFixed(0)}s`);
 if (res.dbg) {
-  console.log(`[dbg] 纹理强度 ${(res.dbg.tex*100).toFixed(1)}%  深色区块 ${res.dbg.dark}  其中细线 ${res.dbg.darkThin}  小块残留 ${res.dbg.smallLeft}`);
+  console.log(`[dbg] 纹理强度 ${(res.dbg.tex*100).toFixed(1)}%  深色区块 ${res.dbg.dark}  其中细线 ${res.dbg.darkThin}  纹理像素块 ${res.dbg.texPix}  小块残留 ${res.dbg.smallLeft}`);
+  console.log(`[dbg] 细线组：跟对象 ${res.dbg.inkToObj}  留最后 ${res.dbg.inkLast}`);
   console.log('[dbg] 调色板: ' + res.palette.map((c, i) => `${i}:(${c.join(',')})`).join(' '));
 }
 console.log(`[test] 平均差 ${(sum / tot).toFixed(2)}/255   可见差异 ${(bad / tot * 100).toFixed(2)}%`);

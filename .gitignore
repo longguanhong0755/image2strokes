@@ -2,3 +2,8 @@ dev/*.raw
 dev/*.rgb
 dev/*.png
 dev/*.jpg
+dev/*.log
+dev/*.txt
+dev/kf/
+dev/stg/
+*.bak

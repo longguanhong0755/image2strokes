@@ -26,7 +26,7 @@ let travels = null, beats = null, msPaint = null;
 let targetMs = 240000;
 let airPath = null;             // 抬笔移动的弧线（画在纸面上的淡虚线）
 const lastEnd = [0, 0];         // 上一笔收笔的位置（抬笔弧线的起点）
-const PHASES = ['起稿', '铺色', '收形', '点睛'];
+const PHASES = ['铺底色', '铺色', '题字', '点睛'];
 
 // ---------------- 工具 ----------------
 const clamp = (v, a, b) => (v < a ? a : (v > b ? b : v));
@@ -120,7 +120,7 @@ function onWorker(e) {
   $('stage').style.display = 'none';
   $('canvasWrap').style.display = 'block';
   $('stat').innerHTML = '共 <em>' + STATS.strokes + '</em> 笔 · 约 <em>' +
-    Math.round(STATS.totalMs / 1000) + '</em> 秒画完（1×）· 起稿 → 铺色 → 收形 → 点睛' +
+    Math.round(STATS.totalMs / 1000) + '</em> 秒画完（1×）· 铺底色 → 铺色 → 题字 → 点睛' +
     (STATS.photo ? ' · 已按照片自动用 <em>' + STATS.colors + '</em> 色' : (STATS.colors ? ' · ' + STATS.colors + ' 色' : ''));
   for (const id of ['expVideo', 'expJson', 'expPng']) { const b = $(id); if (b) b.disabled = false; }
   $('expMsg').textContent = '';
@@ -653,39 +653,34 @@ function addDotStroke(cl, grow, dest) {
   paintStroke(STROKES.length - 1, 1, dest);
 }
 
-// 成品自检：在**自己的画布**上把整幅重画一遍，扫"该有色却是白的"像素并补笔，扫到 0 才收手。
-// 三件事决定了它必须这么写：
-//   1) 不能挡住开播——用户在等的是"开始画"，所以自检在后台跑，播放照常；
+// 成品自检：扫"该有色却是白的"像素并补笔，扫到 0 才收手。
+// 三条约束：
+//   1) 不能挡住开播——用户在等的是"开始画"，所以自检在回放跑完之后再做；
 //   2) 不能依赖 setTimeout/await 链——标签页被节流时那种链会长时间不回来，页面看着像死了；
 //      改由主循环 tick() 分片推进（rAF 和 50ms 看门狗双驱动，播放能跑它就一定能跑）；
-//   3) 不能和正在播放的成品抢画布——用自己的离屏画布，补笔备好后追加到时间轴末尾
-//      （这时播放通常才到"铺色"，远没到末尾的收尾补笔）。
+//   3) 不能跟回放抢主线程——早先的写法是在离屏画布上把整幅重画一遍（两万笔 ≈ 26 秒纯 CPU），
+//      把 240 秒的回放拖成好几分钟；现在等回放画完，直接扫它画出来的那张成品，一笔都不用重画。
 let selfCheckGen = 0;
-let checkState = null;            // { gen, phase, i, round, added, left, head, cv }
-let chkC = null;                  // 自检用的离屏画布
+let checkState = null;            // { gen, phase, round, added, left, head, cv, from }
 function startSelfCheck(head) {
-  if (!chkC || chkC.width !== W || chkC.height !== H) {
-    chkC = document.createElement('canvas'); chkC.width = W; chkC.height = H;
-  }
-  const cx = chkC.getContext('2d');
-  cx.setTransform(1, 0, 0, 1, 0, 0);
-  cx.fillStyle = '#ffffff'; cx.fillRect(0, 0, W, H);
-  checkState = { gen: ++selfCheckGen, phase: 1, i: 0, round: 0, added: 0, left: 0, head: head || '', cv: chkC, from: STROKES.length };
-  selfChecking = true;
-  $('stat').innerHTML = (head || '') + ' · 白点自检中…';
+  // 自检要的是"成品画布"，而回放本身就在把成品一笔一笔堆出来 —— 所以先等着，别抢主线程。
+  // 老做法是在离屏画布上把整幅**重画一遍**（两万笔 ≈ 26 秒纯 CPU），跟回放抢主线程，
+  // 结果 240 秒的回放被拖成好几分钟；回放画完时 painted 就是成品，直接扫它，一笔都不用重画。
+  checkState = { gen: ++selfCheckGen, phase: 0, i: 0, round: 0, added: 0, left: 0, head: head || '', cv: null, from: STROKES.length };
   return checkState;
 }
 function stepSelfCheck(gap) {
   const cs = checkState;
   if (!cs) { selfChecking = false; return; }
   if (cs.gen !== selfCheckGen) { checkState = null; selfChecking = false; return; }
-  if (cs.phase === 1) {                                     // 重画（每帧一片）
-    // 每帧的工作量按"上一帧隔了多久"自适应：正常帧 250ms 一批，页面被节流时一帧顶几十秒，
-    // 就一次多画一些（最多 5 秒），否则自检要等十几分钟。
-    const budget = (gap || 0) > 800 ? 5000 : 250;
-    const t0 = performance.now();
-    while (cs.i < cs.from && performance.now() - t0 < budget) { paintStroke(cs.i, 1, cs.cv); cs.i++; }
-    if (cs.i >= cs.from) cs.phase = 2;
+  if (cs.phase === 0) {                                     // 等回放把成品画完
+    if (!done) return;
+    cs.head = $('stat').innerHTML;                          // 这时状态行里已经有成品读数了
+    cs.cv = painted;                                        // 回放画出来的就是成品，直接扫它
+    cs.phase = 2;
+    cs.from = STROKES.length;
+    selfChecking = true;
+    $('stat').innerHTML = (cs.head || '') + ' · 白点自检中…';
     return;
   }
   const dots = whiteDots(cs.cv);

@@ -1,5 +1,5 @@
 /* 提炼管线跑在 Worker 里：主线程只负责界面与回放 */
-importScripts('pipeline.js?v=10');
+importScripts('pipeline.js?v=19');
 
 self.onmessage = async function (e) {
   const d = e.data;
