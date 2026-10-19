@@ -76,7 +76,10 @@
   }
 
   // sRGB(0..255) → Lab
-  function srgb2lab(r, g, b) {
+  // f 提到外面：原来它在函数里，每次调用都要新建一个闭包（全图百万像素 = 百万个闭包）
+  const LABF = (t) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  // 热循环用这个版本：结果写进调用方的 out，不返回新数组（少一次分配/像素）
+  function srgb2labInto(r, g, b, out) {
     r /= 255; g /= 255; b /= 255;
     r = r > 0.04045 ? Math.pow((r + 0.055) / 1.055, 2.4) : r / 12.92;
     g = g > 0.04045 ? Math.pow((g + 0.055) / 1.055, 2.4) : g / 12.92;
@@ -84,9 +87,12 @@
     let X = (r * 0.4124 + g * 0.3576 + b * 0.1805) / 0.95047;
     let Y = (r * 0.2126 + g * 0.7152 + b * 0.0722);
     let Z = (r * 0.0193 + g * 0.1192 + b * 0.9505) / 1.08883;
-    const f = (t) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
-    X = f(X); Y = f(Y); Z = f(Z);
-    return [116 * Y - 16, 500 * (X - Y), 200 * (Y - Z)];
+    X = LABF(X); Y = LABF(Y); Z = LABF(Z);
+    out[0] = 116 * Y - 16; out[1] = 500 * (X - Y); out[2] = 200 * (Y - Z);
+    return out;
+  }
+  function srgb2lab(r, g, b) {
+    return srgb2labInto(r, g, b, [0, 0, 0]);
   }
 
   // ---------------- 多边形扫描线填充（偶奇），写入 bbox 局部掩膜 ----------------
@@ -300,6 +306,22 @@
   function closeMask(m, w, h, r) {
     if (r <= 0) return m.slice();
     return erode(dilate(m, w, h, r), w, h, r);
+  }
+
+  // 圆盘核闭运算（八边形近似，走距离变换）。图层"完整形状"必须用它：
+  // 方形核在斜边和拐角处会推出方角小凸起，回放画到那一层时字/飞机边上就会露出
+  // 几个方块"耳朵"（2026-10-18 用户点出的遗留）。同样的半径下圆盘是方形的子集，
+  // 补出来的"被上层盖住的部分"更贴形状。
+  function closeMaskDisk(m, w, h, r) {
+    if (r <= 0) return m.slice();
+    const n = w * h, R3 = 3 * r;          // 距离变换是 3-4 通道度量：正交一步 = 3
+    const inv = new Uint8Array(n), dil = new Uint8Array(n), out = new Uint8Array(n);
+    for (let i = 0; i < n; i++) inv[i] = m[i] ? 0 : 1;
+    const dOut = distanceTransform(inv, w, h);      // 到最近"本层像素"的距离
+    for (let i = 0; i < n; i++) dil[i] = dOut[i] <= R3 ? 1 : 0;
+    const dIn = distanceTransform(dil, w, h);       // 到最近"膨胀后仍在外面"的距离
+    for (let i = 0; i < n; i++) out[i] = dIn[i] > R3 ? 1 : 0;
+    return out;
   }
 
   // ---------------- 连通域（给定标签图，4 连通，只保留"同标签"连通） ----------------
@@ -693,11 +715,11 @@
     const asg = new Int32Array(n);
     for (let it = 0; it < iters; it++) {
       let moved = 0;
-      for (let i = 0; i < n; i++) {
-        const L = samples[i * 3], A = samples[i * 3 + 1], B = samples[i * 3 + 2];
+      for (let i = 0, i3 = 0; i < n; i++, i3 += 3) {
+        const L = samples[i3], A = samples[i3 + 1], B = samples[i3 + 2];
         let best = 0, bd = Infinity;
-        for (let k = 0; k < K; k++) {
-          const dL = L - cen[k * 3], dA = A - cen[k * 3 + 1], dB = B - cen[k * 3 + 2];
+        for (let k = 0, k3 = 0; k < K; k++, k3 += 3) {
+          const dL = L - cen[k3], dA = A - cen[k3 + 1], dB = B - cen[k3 + 2];
           const d = dL * dL + dA * dA + dB * dB;
           if (d < bd) { bd = d; best = k; }
         }
@@ -737,7 +759,8 @@
     rimLinearOnly: true,    // 只对细长层做（大块平涂层的边由残差收拾，做了会多出几千笔）
     bleedOrder: true,       // 出界笔只许压在"已经画过"的对象上（否则那圈颜色留在别人身上）
     profFlatSample: true,   // 细长层取色用平头变宽笔形
-    occlude: true,          // 每层补出"被上层盖住的部分"（形状闭合推断）；照片类纹理太碎时关掉更干净
+    occlude: true,
+  objGrowF: 0.55,      // 图层"完整形状"往外补的系数（见 closeMaskDisk 的注释；0.8 会伸出圆头小凸起）          // 每层补出"被上层盖住的部分"（形状闭合推断）；照片类纹理太碎时关掉更干净
     colorPass: true,        // 同色合并成"一趟"：互不遮挡的层之间顺序自由，优先挑"跟上一笔同色、
                             // 且离笔尖近"的那层——同一支笔一路把同色的东西画完（原来是按面积大小排，
                             // 笔尖在整幅上按"大块→小块"来回跳，一个字一层）
@@ -981,10 +1004,13 @@
     const nS = Math.ceil(N / step);
     const samp = new Float32Array(nS * 3);
     let ns = 0;
-    for (let i = 0; i < N; i += step) {
-      const lab = srgb2lab(Rs[i], Gs[i], Bs[i]);
-      samp[ns * 3] = lab[0]; samp[ns * 3 + 1] = lab[1]; samp[ns * 3 + 2] = lab[2];
-      ns++;
+    {
+      const lab = [0, 0, 0];
+      for (let i = 0; i < N; i += step) {
+        srgb2labInto(Rs[i], Gs[i], Bs[i], lab);
+        samp[ns * 3] = lab[0]; samp[ns * 3 + 1] = lab[1]; samp[ns * 3 + 2] = lab[2];
+        ns++;
+      }
     }
     const { cen } = kmeans(samp.subarray(0, ns * 3), opts.colors, 12, 12345);
     const cenRaw = Array.from(cen, (v) => Math.round(v));
@@ -1002,19 +1028,25 @@
       if (hit < 0) { pal.push([cen[k * 3], cen[k * 3 + 1], cen[k * 3 + 2], 0]); hit = pal.length - 1; }
       pai[k] = hit;
     }
-    // 中心 → 代表 RGB（用该中心附近的像素均值）
+    // 中心 → 代表 RGB（用该中心附近的像素均值），顺带把"每个像素属于哪个调色板色"
+    // 一次算完（labels）。这两件事原来各跑了一遍全图 × K 色的最近中心搜索，
+    // 用的是同一份 cen/pai（中间没有任何改动）⇒ 结果逐位相同，纯白跑一遍。
+    const labels = new Uint8Array(N);
     {
       const accR = new Float64Array(pal.length), accG = new Float64Array(pal.length),
             accB = new Float64Array(pal.length), cnt = new Float64Array(pal.length);
+      const lab = [0, 0, 0];
       for (let i = 0; i < N; i++) {
-        const lab = srgb2lab(Rs[i], Gs[i], Bs[i]);
+        srgb2labInto(Rs[i], Gs[i], Bs[i], lab);
+        const l0 = lab[0], l1 = lab[1], l2 = lab[2];
         let best = 0, bd = Infinity;
-        for (let k = 0; k < K; k++) {
-          const dL = lab[0] - cen[k * 3], dA = lab[1] - cen[k * 3 + 1], dB = lab[2] - cen[k * 3 + 2];
+        for (let k = 0, k3 = 0; k < K; k++, k3 += 3) {
+          const dL = l0 - cen[k3], dA = l1 - cen[k3 + 1], dB = l2 - cen[k3 + 2];
           const d = dL * dL + dA * dA + dB * dB;
           if (d < bd) { bd = d; best = k; }
         }
         const p = pai[best];
+        labels[i] = p;
         accR[p] += R[i]; accG[p] += G[i]; accB[p] += B[i]; cnt[p]++;
       }
       for (let p = 0; p < pal.length; p++) {
@@ -1023,18 +1055,7 @@
     }
     prog(0.16, '分块…'); await yieldUI();
 
-    // 3) 全图归类
-    const labels = new Uint8Array(N);
-    for (let i = 0; i < N; i++) {
-      const lab = srgb2lab(Rs[i], Gs[i], Bs[i]);
-      let best = 0, bd = Infinity;
-      for (let k = 0; k < K; k++) {
-        const dL = lab[0] - cen[k * 3], dA = lab[1] - cen[k * 3 + 1], dB = lab[2] - cen[k * 3 + 2];
-        const d = dL * dL + dA * dA + dB * dB;
-        if (d < bd) { bd = d; best = k; }
-      }
-      labels[i] = pai[best];
-    }
+    // 3) 全图归类 —— 已在上面的循环里一起算完（labels），这里不再重复搜一遍
 
     // 4) 连通域
     let { compOf, pix, comps } = compsOfLabels(labels, W, H);
@@ -1054,8 +1075,12 @@
       const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
       let nSmall = 0, nMerged = 0, nNoVote = 0, nFar = 0, nNaN = 0;
       const thinLim = 9.0 * (W / 1024);   // 平均笔画宽度 ≤ 它就算细线（对齐原来 maxr ≤ 6.5*scale 的口径）
+      // 邻块投票的计数用 Int32Array + touched 列表，不用 Map：数字键的 Map 在这
+      // 是几百万次哈希（3 万块 × 8 邻域 × 2 轮），换数组后同样的算术、同样的
+      // "首次遇到顺序" ⇒ bestScore 并列时的取舍一致，结果逐位不变。
+      const vcnt = new Int32Array(comps.length);
+      const touched = [];
       for (let round = 0; round < 2; round++) {
-        const votes = new Map();
         for (let ci = 0; ci < comps.length; ci++) {
           if (find(ci) !== ci) continue;
           const c = comps[ci];
@@ -1066,30 +1091,36 @@
           const thin = estW <= thinLim && c.count >= 8 && elong >= 2.2;
           if (!thin && c.count >= opts.minArea) continue;
           nSmall++;
-          votes.clear();
+          touched.length = 0;
           for (let k = 0; k < c.count; k++) {
             const p = pix[c.start + k];
             const x = p % W, y = (p - x) / W;
             for (let dy = -1; dy <= 1; dy++) {
+              const yy = y + dy;
+              if (yy < 0 || yy >= H) continue;
+              const row = yy * W;
               for (let dx = -1; dx <= 1; dx++) {
                 if (!dx && !dy) continue;
-                const xx = x + dx, yy = y + dy;
-                if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
-                const cj = find(compOf[yy * W + xx]);
+                const xx = x + dx;
+                if (xx < 0 || xx >= W) continue;
+                const cj = find(compOf[row + xx]);
                 if (cj === ci) continue;
-                votes.set(cj, (votes.get(cj) || 0) + 1);
+                if (vcnt[cj]++ === 0) touched.push(cj);
               }
             }
           }
+          const pi = pal[c.label];
           let bestJ = -1, bestScore = -1;
-          for (const [cj, v] of votes) {
-            const pj = pal[comps[cj].label], pi = pal[c.label];
+          for (let ti = 0; ti < touched.length; ti++) {
+            const cj = touched[ti], v = vcnt[cj];
+            const pj = pal[comps[cj].label];
             const cd = Math.hypot(pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]);
             const score = v / (1 + cd * 0.5);
             if (score > bestScore) { bestScore = score; bestJ = cj; }
           }
+          for (let ti = 0; ti < touched.length; ti++) vcnt[touched[ti]] = 0;
           if (bestJ < 0) { nNoVote++; continue; }
-          const pj = pal[comps[bestJ].label], pi = pal[c.label];
+          const pj = pal[comps[bestJ].label];
           if (!pj || !pi) { nNaN++; continue; }
           const cd = Math.hypot(pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]);
           // 纹理判据：小块 + 对比不强 ⇒ 纸纹/噪点（并进邻块、不画）
@@ -1762,6 +1793,7 @@
       dbg.loose = 0;
       dbg.cores = groups.length;
       dbg.objs = nObj;
+      lap('sweep:uf');
       // --- 像素索引图 + 逐层统计 ---
       objLab = new Int32Array(N);
       for (let p = 0; p < N; p++) objLab[p] = objOfComp[compOf[p]];
@@ -1825,6 +1857,7 @@
         if (st.tmin > st.tmax) { st.tmin = st.tmax = 0; }
         st.hp = Math.max(1, st.vmax);
       }
+      lap('sweep:stat');
       // 底色层：第一个非纸底的层
       baseObj = -1;
       for (let oi = 0; oi < nObj; oi++) if (!objStat[oi].isPaper && objStat[oi].area >= 200) { baseObj = oi; break; }
@@ -1894,6 +1927,7 @@
         }
         dbg.edgeSnap = snapped;
       }
+      lap('sweep:rejudge');
       // --- 过渡带（抗锯齿斜坡）不能单独成层 ---
       // 目标图的边上有 1~3px 的混色带；量化会把它切成"一条细长的区块"，
       // 于是它自己成了一层、被涂成中间那个灰紫色（飞机边上的灰条就是这么来的）。
@@ -1956,6 +1990,7 @@
         dbg.edgeRamp = rampN;
       }
       // 扫描件的网点 + 抗锯齿会把直边搅成 2px 上下的锯齿（用户说的"本来是直的却像被啃过"）。
+      lap('sweep:ramp');
       // --- 掩膜边界"去锯齿"（多数表决）---
       // 扫描件的网点 + 抗锯齿会把直边搅成 2px 上下的锯齿（用户说的"本来是直的却像被啃过"）。
       // 在 5x5 窗口里数各层占了多少格，只有"压倒性多数"（≥ maskMajThr）才改判：
@@ -1994,6 +2029,7 @@
           dbg.maskMaj = (dbg.maskMaj || 0) + chP.length;
         }
       }
+      lap('sweep:maj');
       // --- 可见部分的掩膜 + 每层的"厚度/细长"判定 ---
       for (let oi = 0; oi < nObj; oi++) {
         const st = objStat[oi];
@@ -2015,6 +2051,7 @@
         // 否则照片里一大片细长的区域也会被判成"线"，几千笔去描它）
         st.linear = elong >= 9 && med * 2 <= Math.max(12, 24 * strokeScale);
       }
+      lap('sweep:vis');
       // --- 完整形状：底色层 = 整幅（除了纸底）；其它层 = 自己可见的部分 ∪ 被上层盖住的部分 ---
       // "被上层盖住的部分"用形状闭合推断：把本层形状按"贴着它的上层有多厚"闭一下，
       // 闭出来的区域里属于上层的像素就是"本来也是这一层、只是被盖住了"。
@@ -2033,7 +2070,10 @@
         if (st.isPaper || !opts.occlude) { objFull.push(own); continue; }  // own 现在带 x0/y0
         let r = 0;
         for (const ob of objAdj[oi]) if (ob > oi && !objStat[ob].isPaper) r = Math.max(r, objStat[ob].hp * 2);
-        r = clamp(Math.round(r * 0.8), 3, 26);
+        // 外扩量 = 贴着它的上层有多厚 × 系数（objGrowF）。补出来的"完整形状"只要盖到
+        // 上层的一半就够，再往外就是上层自己的地盘 —— 系数偏大时，字/飞机那些凸出的
+        // 部位会伸出一圈圆头小凸起（回放画到那一层时看得见）。
+        r = clamp(Math.round(r * opts.objGrowF), 3, 26);
         if (r <= 3) { objFull.push(own); continue; }
         const bx0 = Math.max(0, st.x0 - r), by0 = Math.max(0, st.y0 - r);
         const bx1 = Math.min(W - 1, st.x1 + r), by1 = Math.min(H - 1, st.y1 + r);
@@ -2049,7 +2089,7 @@
           }
         }
         if (!any) { objFull.push(own); continue; }
-        const cl = closeMask(sub, bw, bh, r);
+        const cl = closeMaskDisk(sub, bw, bh, r);
         const m = new Uint8Array(bw * bh);
         let added = 0;
         for (let i = 0; i < m.length; i++) {
@@ -2060,6 +2100,7 @@
         st.grown = added;
         objFull.push({ x0: bx0, y0: by0, w: bw, h: bh, m });
       }
+      lap('sweep:full');
       // --- 底色层的"背景色场"：被字/飞机盖住的地方看不见，按周围推出来 ---
       // 已知像素 = 底色层自己（往里缩 2px 避开边界混色），颜色取平滑图；未知像素按"最近的
       // 已知像素"向里灌（chamfer 两趟），再平滑几遍 —— 整幅任何位置都能取到底色。
@@ -2071,6 +2112,7 @@
           for (let x = 0; x < bm.w; x++) if (bm.m[y * bm.w + x]) bin[row + objStat[baseObj].x0 + x] = 1;
         }
         const core = erode(bin, W, H, 3);
+        lap('bg:core');
         const smoothish = (p2) => {   // 平滑图在这里可不可信（跟区块纯色对得上 = 没被隔壁糊过来）
           const rc2 = regions[compOf[p2]].color;
           return Math.abs(rc2[0] - Rs[p2]) + Math.abs(rc2[1] - Gs[p2]) + Math.abs(rc2[2] - Bs[p2]) <= 36;
@@ -2107,6 +2149,7 @@
           }
           known[p] = 1; nKnown++;
         }
+        lap('bg:known');
         const INF = 1e9;
         const dist = new Float32Array(N);
         for (let p = 0; p < N; p++) dist[p] = known[p] ? 0 : INF;
@@ -2134,25 +2177,57 @@
             if (x > 0 && y + 1 < H) prop(p, p + W - 1, 4);
           }
         }
-        for (let it = 0; it < 4; it++) {          // 整体平滑几遍：灌出来的硬边、区块之间的色阶差都抹平
-          const nr = new Float32Array(cr), ng = new Float32Array(cg), nb = new Float32Array(cb);
-          for (let y = 0; y < H; y++) {
-            for (let x = 0; x < W; x++) {
-              const p = y * W + x;
-              let sr = 0, sg = 0, sb = 0, cnt = 0;
-              for (let dy = -1; dy <= 1; dy++) {
-                const yy = y + dy; if (yy < 0 || yy >= H) continue;
-                for (let dx = -1; dx <= 1; dx++) {
-                  const xx = x + dx; if (xx < 0 || xx >= W) continue;
-                  const q = yy * W + xx;
-                  sr += cr[q]; sg += cg[q]; sb += cb[q]; cnt++;
-                }
-              }
-              nr[p] = sr / cnt; ng[p] = sg / cnt; nb[p] = sb / cnt;
+        lap('bg:chamfer');
+        // 平滑 4 遍（3×3 盒式模糊）：灌出来的硬边、区块之间的色阶差都抹平。
+        // 提速两处，都不改结果：
+        // ① 内点（1..H-2 行 × 1..W-2 列）九邻域齐全 ⇒ 去掉全部边界判断和 yy*W 乘法，
+        //    计数恒为 9；边界像素只有 O(W+H) 个，照旧走通用写法。
+        // ② 双缓冲，省掉每遍 new 三个 4MB 数组 + cr.set(nr) 的两趟拷贝。
+        // 为什么"展开"不改结果：输入是 float32（24 位尾数），9 个数相加最多 28 位
+        // < float64 的 53 位 ⇒ 求和本来就是精确的、与加法顺序无关。
+        let curR = cr, curG = cg, curB = cb;
+        let nxtR = new Float32Array(N), nxtG = new Float32Array(N), nxtB = new Float32Array(N);
+        const blurGeneric = (x, y) => {
+          const p = y * W + x;
+          let sr = 0, sg = 0, sb = 0, cnt = 0;
+          for (let dy = -1; dy <= 1; dy++) {
+            const yy = y + dy; if (yy < 0 || yy >= H) continue;
+            for (let dx = -1; dx <= 1; dx++) {
+              const xx = x + dx; if (xx < 0 || xx >= W) continue;
+              const q = yy * W + xx;
+              sr += curR[q]; sg += curG[q]; sb += curB[q]; cnt++;
             }
           }
-          cr.set(nr); cg.set(ng); cb.set(nb);
+          nxtR[p] = sr / cnt; nxtG[p] = sg / cnt; nxtB[p] = sb / cnt;
+        };
+        for (let it = 0; it < 4; it++) {
+          if (W >= 3 && H >= 3) {
+            for (let y = 1; y < H - 1; y++) {
+              const yc = y * W;
+              for (let x = 1; x < W - 1; x++) {
+                const p = yc + x;
+                let sr = 0, sg = 0, sb = 0;
+                for (let dy = -1; dy <= 1; dy++) {
+                  const row = yc + dy * W;
+                  for (let dx = -1; dx <= 1; dx++) {
+                    const q = row + x + dx;
+                    sr += curR[q]; sg += curG[q]; sb += curB[q];
+                  }
+                }
+                nxtR[p] = sr / 9; nxtG[p] = sg / 9; nxtB[p] = sb / 9;
+              }
+            }
+            for (let x = 0; x < W; x++) { blurGeneric(x, 0); blurGeneric(x, H - 1); }
+            for (let y = 1; y < H - 1; y++) { blurGeneric(0, y); blurGeneric(W - 1, y); }
+          } else {
+            for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) blurGeneric(x, y);
+          }
+          { const t = curR; curR = nxtR; nxtR = t; }
+          { const t = curG; curG = nxtG; nxtG = t; }
+          { const t = curB; curB = nxtB; nxtB = t; }
         }
+        if (curR !== cr) { cr.set(curR); cg.set(curG); cb.set(curB); }
+        lap('bg:blur');
         bgMap = { R: cr, G: cg, B: cb };
         dbg.bgFill = nKnown;
         }
@@ -2171,6 +2246,7 @@
           dbg.bgMapImg = bm2;
         }
       }
+      lap('sweep:obj');
       // ---- 细线组划分 + 归属（"两拨画法"的分派表）----
       // 算一次连通域，按"行"排好（文字和轮廓都是成行成列的），再看每组贴着谁：
       // 贴着"某个对象"的 ⇒ 跟那个对象一起画（猫嘴跟着猫脸，字的描边走完字就画上）；
@@ -2726,6 +2802,7 @@
         }
       };
 
+      lap('sweep:layerprep');
       // ---- 绘制顺序：同色合并成"一趟" ----
       // 层与层之间只有"谁盖谁"这一条硬约束：A 的完整形状盖到了 B 的可见像素 ⇒ B 必须先画。
       // 其余两两之间顺序完全自由 —— 那就优先挑"跟上一笔同色、又离笔尖近"的那层，
@@ -2851,6 +2928,7 @@
         bleedOK.fill(1);
       }
 
+      lap('sweep:order');
       // ---- 逐层画 ----
       const TT = {}; let tMark = Date.now();
       const tick = (k) => { const n = Date.now(); TT[k] = (TT[k] || 0) + (n - tMark); tMark = n; };
@@ -3289,6 +3367,7 @@
                              // 质量变好但耗时变长——那属于另一件事，不该被"省笔"顺手带出来
       const nSched = opts.residual.length;
       const nRounds = nSched + (opts.resTail | 0);
+      let dArr = null;   // 轮末存下的"每像素最大通道差"，供下一轮的 skip 复用（见下面的注释）
       for (let round = 0; round < nRounds; round++) {
         // 预算闸门：排定轮次（粗→细的固定档）用完就停，但**尾巴轮**（自适应续补）只要还有收益就走，
         // 否则"还没收敛就被预算砍掉"——那正是老版本海报停在 20%、照片停在 29% 的原因。
@@ -3310,13 +3389,20 @@
         lap('r:begin');
         const skip = new Uint8Array(N);
         {
-          const wrongAll = new Uint8Array(N);
-          for (let i2 = 0; i2 < N; i2++) {
-            const d2 = Math.max(Math.abs(canvas[i2 * 3] - R[i2]),
-                                Math.abs(canvas[i2 * 3 + 1] - G[i2]),
-                                Math.abs(canvas[i2 * 3 + 2] - B[i2]));
-            if (d2 > thr) wrongAll[i2] = 1;
+          // "最大通道差"整幅重算一遍是这里最贵的一步（百万像素 × 3 通道）。
+          // 轮末算"可见差异"时反正要算一次，顺手存进 dArr 留给下一轮用 ——
+          // 两处看的是同一份画布（中间只有 prog/yieldUI，不改像素），
+          // 所以这里只做一次比较（dArr > thr），结果完全一样。
+          if (!dArr) {
+            dArr = new Uint8Array(N);
+            for (let i2 = 0; i2 < N; i2++) {
+              dArr[i2] = Math.max(Math.abs(canvas[i2 * 3] - R[i2]),
+                                  Math.abs(canvas[i2 * 3 + 1] - G[i2]),
+                                  Math.abs(canvas[i2 * 3 + 2] - B[i2]));
+            }
           }
+          const wrongAll = new Uint8Array(N);
+          for (let i2 = 0; i2 < N; i2++) if (dArr[i2] > thr) wrongAll[i2] = 1;
           const wcc = compsOfLabels(wrongAll, W, H);
           for (let ci = 0; ci < wcc.comps.length; ci++) {
             const c = wcc.comps[ci];
@@ -3518,9 +3604,11 @@
         lap('r:flush');
         nPieces += added;
         mark('残差' + (round + 1));
+        // 一次算完"每像素最大通道差"和"可见差异计数"：dArr 留给下一轮的 skip 用
         let bad = 0;
         for (let i = 0; i < N; i++) {
           const d = Math.max(Math.abs(canvas[i * 3] - R[i]), Math.abs(canvas[i * 3 + 1] - G[i]), Math.abs(canvas[i * 3 + 2] - B[i]));
+          dArr[i] = d;
           if (d > 8) bad++;
         }
         const pct = bad / N * 100;
@@ -3927,5 +4015,5 @@
     };
   }
 
-  root.ISP_PIPELINE = { run, CFG, _u: { ribbon, ribbonProf, fillPoly, fillPolyCov, distanceTransform, thin, longestPath, compsOfLabels, dilate, erode, closeMask, rdpSimplify, mergeLoops } };
+  root.ISP_PIPELINE = { run, CFG, _u: { ribbon, ribbonProf, fillPoly, fillPolyCov, distanceTransform, thin, longestPath, compsOfLabels, dilate, erode, closeMask, closeMaskDisk, rdpSimplify, mergeLoops } };
 })(typeof self !== 'undefined' ? self : globalThis);
