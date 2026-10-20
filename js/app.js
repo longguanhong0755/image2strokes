@@ -21,6 +21,7 @@ let selfChecking = false;         // 成品自检（找白点）进行中：期�
 let rushing = false;              // "看成品"：快进到画完（每帧画一大批，画面看得见在飞速推进）
 let draggingSeek = false;         // 正在拖进度条：这期间 hud 不要回写滑块位置
 let checkMsg = '';                // 自检结论（挂在状态行末尾，一直都在）
+let extracting = false;           // 正在提炼：期间不接受第二次选图，避免两个任务在 worker 里串味
 // "像人在画"需要的三段时间轴：抬笔移动 travel + 换阶段停顿 beat + 落笔绘制 paint
 let travels = null, beats = null, msPaint = null;
 let targetMs = 240000;
@@ -78,14 +79,32 @@ function fitImage(img) {
   return c;
 }
 
+/* 提示同时写两处：#note 常驻在选图框下面（提炼开始前也看得见），
+   #status 只在进度条那块显示时才可见——原来错误只写 #status，等于永远看不到 */
+function note(msg, kind) {
+  const n = $('note');
+  if (n) { n.textContent = msg; n.className = 'note' + (msg ? ' show ' + (kind || 'info') : ''); }
+  const s = $('status');
+  if (s && $('stage').style.display !== 'none') s.textContent = msg;
+}
+
+function setExtracting(on) {
+  extracting = on;
+  const dz = $('drop');
+  if (dz) { dz.classList.toggle('busy', on); dz.setAttribute('aria-busy', on ? 'true' : 'false'); }
+  document.querySelectorAll('[data-sample]').forEach((b) => { b.disabled = on; });
+}
+
 function startExtract(imgCanvas) {
+  if (extracting) { note('上一张还在提炼，等它跑完再换。', 'warn'); return; }
   W = imgCanvas.width; H = imgCanvas.height;
   const ctx2 = imgCanvas.getContext('2d');
   target = ctx2.getImageData(0, 0, W, H);
   $('stage').style.display = 'block';
   $('canvasWrap').style.display = 'none';
   $('welcome').style.display = 'none';
-  $('status').textContent = '正在提炼…';
+  note('正在提炼…', 'info');
+  setExtracting(true);
   $('bar').style.width = '0%';
   const detail = parseInt($('detail').value, 10);
   const opts = {
@@ -98,7 +117,7 @@ function startExtract(imgCanvas) {
   if (!worker) {
     worker = new Worker('js/worker.js?v=9');
     worker.onmessage = onWorker;
-    worker.onerror = (e) => { $('status').textContent = '出错：' + e.message; };
+    worker.onerror = (e) => { setExtracting(false); note('出错：' + e.message, 'err'); };
   }
   const copy = new Uint8ClampedArray(target.data);   // 原数据留着做对比
   worker.postMessage({ px: copy.buffer, W, H, opts }, [copy.buffer]);
@@ -111,7 +130,8 @@ function onWorker(e) {
     if (d.msg) $('status').textContent = d.msg;
     return;
   }
-  if (d.type === 'error') { $('status').textContent = '出错：' + d.msg; return; }
+  if (d.type === 'error') { setExtracting(false); note('出错：' + d.msg, 'err'); return; }
+  setExtracting(false);
   STROKES = d.res.strokes; CLIPS = d.res.clips; STATS = d.res.stats;
   KEYFRAMES = (d.res.keys || []).map((k) => ({ i: k.i, rgb: k.rgb }));
   buildCanvases();
@@ -119,6 +139,7 @@ function onWorker(e) {
   checkMsg = '';
   $('stage').style.display = 'none';
   $('canvasWrap').style.display = 'block';
+  fitView();                       // 画布刚可见时才量得到容器宽度（buildCanvases 里那次量到的是 0）
   $('stat').innerHTML = '共 <em>' + STATS.strokes + '</em> 笔 · 约 <em>' +
     Math.round(STATS.totalMs / 1000) + '</em> 秒画完（1×）· 铺底色 → 铺色 → 题字 → 点睛' +
     (STATS.photo ? ' · 已按照片自动用 <em>' + STATS.colors + '</em> 色' : (STATS.colors ? ' · ' + STATS.colors + ' 色' : ''));
@@ -192,6 +213,7 @@ function buildTimeline() {
 
 function fitView() {
   const wrap = $('canvasWrap');
+  if (!W || !wrap.clientWidth) return;   // 容器还没显示（宽度为 0）时量出来是负数，等比算出来的宽度会被浏览器丢掉
   const maxW = wrap.clientWidth - 8, maxH = window.innerHeight - 190;
   const s = Math.min(maxW / W, maxH / H, 1);
   const cv = $('cv');
@@ -886,23 +908,66 @@ function exportJson() {
 
 // ---------------- 交互 ----------------
 function bindUI() {
+  const dz = $('drop');
+  const openPicker = () => { if (!extracting) $('file').click(); };
+  /* 原来这个框只写了"点击或拖入"，但没有任何 click 处理器——点它没反应，只能靠示例图。
+     注意 #file 就嵌在框里，它自己的 click 会冒泡回来，必须挡掉，否则选择器被打开两次 */
+  dz.addEventListener('click', (e) => { if (e.target === $('file')) return; openPicker(); });
+  dz.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.code === 'Space') { e.preventDefault(); openPicker(); }
+  });
   $('file').addEventListener('change', (e) => {
     const f = e.target.files && e.target.files[0];
     if (f) loadFile(f);
+    e.target.value = '';                     // 连续选同一张也能重新触发
   });
-  const dz = $('drop');
-  ['dragenter', 'dragover'].forEach((k) => dz.addEventListener(k, (e) => { e.preventDefault(); dz.classList.add('over'); }));
-  ['dragleave', 'drop'].forEach((k) => dz.addEventListener(k, (e) => { e.preventDefault(); dz.classList.remove('over'); }));
-  dz.addEventListener('drop', (e) => {
+
+  /* 整页都接收拖放：落在选图框外也认；同时拦住浏览器默认行为——
+     否则浏览器会把图片当页面打开，正在跑的东西全丢 */
+  let dragDepth = 0;
+  const mask = $('dropMask');
+  const hasFile = (e) => e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], 'Files') >= 0;
+  const endDrag = () => { dragDepth = 0; if (mask) mask.classList.remove('on'); dz.classList.remove('over'); };
+  window.addEventListener('dragenter', (e) => {
+    if (!hasFile(e)) return;
+    e.preventDefault(); dragDepth++;
+    if (mask) mask.classList.add('on');
+  });
+  window.addEventListener('dragover', (e) => {
+    if (!hasFile(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+  window.addEventListener('dragleave', () => { if (--dragDepth <= 0) endDrag(); });
+  window.addEventListener('drop', (e) => {
+    if (!hasFile(e)) return;
+    e.preventDefault();
     const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    endDrag();
     if (f) loadFile(f);
   });
+  dz.addEventListener('dragenter', () => dz.classList.add('over'));
+  dz.addEventListener('dragleave', () => dz.classList.remove('over'));
+
+  /* 粘贴上传：截完图 Ctrl/Cmd+V 直接进来 */
+  window.addEventListener('paste', (e) => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].kind === 'file' && items[i].type.indexOf('image/') === 0) {
+        const f = items[i].getAsFile();
+        if (f) { e.preventDefault(); loadFile(f); return; }
+      }
+    }
+  });
+
   document.querySelectorAll('[data-sample]').forEach((el) => {
     el.addEventListener('click', () => {
+      if (extracting) { note('上一张还在提炼，等它跑完再换。', 'warn'); return; }
       const im = new Image();
       im.crossOrigin = 'anonymous';
       im.onload = () => startExtract(fitImage(im));
-      im.onerror = () => { $('status').textContent = '示例图加载失败'; };
+      im.onerror = () => note('示例图加载失败，检查一下 samples/ 是否齐全。', 'err');
       im.src = el.getAttribute('data-sample');
     });
   });
@@ -911,10 +976,7 @@ function bindUI() {
     playing = !playing;
     $('play').textContent = playing ? '暂停' : '继续';
   });
-  $('speed').addEventListener('input', (e) => {
-    speed = parseFloat(e.target.value);
-    $('speedVal').textContent = speed.toFixed(2).replace(/0$/, '') + '×';
-  });
+  $('speed').addEventListener('input', (e) => setSpeed(parseFloat(e.target.value)));
   // 进度条：拖动时只更新读数（拖动本身会连续重画上千笔，会卡）；松手/实时轻量跳转
   let lastSeekAt = 0;
   $('seek').addEventListener('pointerdown', () => { draggingSeek = true; });
@@ -942,15 +1004,20 @@ function bindUI() {
     rushing = true; playing = true; $('play').textContent = '暂停';
     $('stat').textContent = '快进到成品…';
   });
+  const jumpPhase = (el) => {                              // 点/按阶段名 → 跳到该阶段开头
+    const ph = parseInt(el.getAttribute('data-ph'), 10);
+    if (!STROKES.length || !cumMs) return;
+    let i = 0;
+    while (i < STROKES.length && (STROKES[i].ph | 0) !== ph) i++;
+    if (i >= STROKES.length) return;
+    playing = false; $('play').textContent = '继续';
+    jumpTo(cumMs[i] / 1000);
+  };
   document.querySelectorAll('#phases span').forEach((el) => {
-    el.addEventListener('click', () => {                 // 点阶段名 → 跳到该阶段开头
-      const ph = parseInt(el.getAttribute('data-ph'), 10);
-      if (!STROKES.length || !cumMs) return;
-      let i = 0;
-      while (i < STROKES.length && (STROKES[i].ph | 0) !== ph) i++;
-      if (i >= STROKES.length) return;
-      playing = false; $('play').textContent = '继续';
-      jumpTo(cumMs[i] / 1000);
+    el.tabIndex = 0; el.setAttribute('role', 'button');
+    el.addEventListener('click', () => jumpPhase(el));
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.code === 'Space') { e.preventDefault(); jumpPhase(el); }
     });
   });
   $('cmp').addEventListener('change', () => {});
@@ -959,16 +1026,54 @@ function bindUI() {
   $('expPng').addEventListener('click', exportPng);
   $('expVideo').addEventListener('click', () => { exportVideo(); });
   $('expJson').addEventListener('click', exportJson);
+
+  const fmtSpeed = (v) => (Math.round(v * 100) / 100) + '×';
+  const setSpeed = (v) => {
+    speed = Math.max(0.25, Math.min(4, Math.round(v * 4) / 4));
+    $('speed').value = String(speed);
+    $('speedVal').textContent = fmtSpeed(speed);
+  };
+  const seekRel = (deltaSec) => {
+    if (!STROKES.length || !cumMs) return;
+    const total = STATS.totalMs / 1000;
+    const cur = (done ? cumMs[STROKES.length] : (cumMs[idx] + acc)) / 1000;
+    playing = false; $('play').textContent = '继续';
+    jumpTo(Math.max(0, Math.min(total, cur + deltaSec)));
+  };
+  const TOGGLE = { KeyO: 'cmp', KeyT: 'tip', KeyG: 'guideChk' };
   document.addEventListener('keydown', (e) => {
-    if (e.code === 'Space' && STROKES.length) { e.preventDefault(); $('play').click(); }
+    if (e.defaultPrevented) return;                                  // 选图框自己处理掉的 Enter/Space 不再抢
+    const t = e.target;
+    if (t && /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)) return;   // 别抢控件自己的按键
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.code === 'Space') {
+      if (STROKES.length) { e.preventDefault(); $('play').click(); }
+      return;
+    }
+    if (TOGGLE[e.code]) {
+      const el = $(TOGGLE[e.code]);
+      el.checked = !el.checked; el.dispatchEvent(new Event('change')); e.preventDefault(); return;
+    }
+    if (!STROKES.length) return;
+    if (e.code === 'ArrowLeft') { e.preventDefault(); seekRel(e.shiftKey ? -30 : -5); }
+    else if (e.code === 'ArrowRight') { e.preventDefault(); seekRel(e.shiftKey ? 30 : 5); }
+    else if (e.code === 'ArrowUp') { e.preventDefault(); setSpeed(speed + 0.25); }
+    else if (e.code === 'ArrowDown') { e.preventDefault(); setSpeed(speed - 0.25); }
+    else if (e.code === 'Home') { e.preventDefault(); seekRel(-1e9); playing = true; $('play').textContent = '暂停'; }
+    else if (e.code === 'End') { e.preventDefault(); $('toEnd').click(); }
   });
 }
 
 function loadFile(f) {
+  if (extracting) { note('上一张还在提炼，等它跑完再换。', 'warn'); return; }
+  if (!f.type || f.type.indexOf('image/') !== 0) { note('这不是图片文件——支持 JPG / PNG / WEBP。', 'err'); return; }
+  if (f.size > 25 * 1024 * 1024) {
+    note('图片超过 25MB，先压一下再传（长边反正只会用到 1024px）。', 'err'); return;
+  }
   const url = URL.createObjectURL(f);
   const im = new Image();
-  im.onload = () => { startExtract(fitImage(im)); URL.revokeObjectURL(url); };
-  im.onerror = () => { $('status').textContent = '图片读取失败'; URL.revokeObjectURL(url); };
+  im.onload = () => { note('', ''); startExtract(fitImage(im)); URL.revokeObjectURL(url); };
+  im.onerror = () => { note('这张图片读不出来，换一张试试。', 'err'); URL.revokeObjectURL(url); };
   im.src = url;
 }
 
