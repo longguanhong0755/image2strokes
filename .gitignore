@@ -7,3 +7,6 @@ dev/*.txt
 dev/kf/
 dev/stg/
 *.bak
+
+# 含明文 GitHub PAT 的内部交接文档，绝不进公开仓库
+HANDOFF.md

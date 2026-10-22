@@ -334,6 +334,7 @@ index.html            页面（上传 + 参数 + 画布 + 回放控件 + 四步�
 js/app.js             主线程：图片预处理、界面、回放引擎（含抬笔移动/阶段停顿）、导出、差异读数
 js/worker.js          Worker 入口
 js/pipeline.js        全部算法（纯 JS，无依赖；也能在 Node 里跑）
+js/engine.js          对外稳定入口（给 inkbrief 等外部项目用；带 api 版本契约）
 samples/              示例图（含授权说明见 samples/CREDITS.md）
 dev/                  开发用小工具
   run_test.mjs        Node 里直接跑管线并出还原度数据（量化回归用，PIPE= 可指定其它管线文件做 A/B）
@@ -360,6 +361,20 @@ dev/                  开发用小工具
 
 > 改了 `js/` 里的脚本后，记得把 `index.html` 里 `<script src="js/app.js?v=N">` 的 `N` 递增一下：
 > GitHub Pages 对静态资源有 10 分钟缓存，容易让人以为改动没生效。
+
+## 给其他项目当引擎用（inkbrief）
+
+inkbrief 在 Worker 里直接加载本项目的 `js/engine.js`，不在自己仓库里存副本。
+所以**改 `pipeline.js` 或 `js/worker.js` 不用通知 inkbrief**，它下次加载就是新引擎。
+
+稳定契约写在 `js/engine.js` 顶部，完整版见 [ENGINE_CONTRACT.md](ENGINE_CONTRACT.md)，要点：
+
+- 外部项目只认 `js/engine.js`；`pipeline.js` 改名/拆分只在 `engine.js` 里同步。
+- 必须保留 `self.ISP_PIPELINE.run(px, W, H, opts, onProgress)` 和返回结构
+  `{ W, H, strokes, clips, stats, dbg? }`。
+- `self.ISP_PIPELINE.api` 是整数契约版本；**破坏性改动必须 +1**，并保留旧 api 的入口，
+  否则 inkbrief 会退到固定 commit 的旧版本（不会崩，但也拿不到新能力）。
+- `js/engine.js` 的缓存号 `?v=` 在契约文件本身变更时才递增。
 
 本地跑回归：
 

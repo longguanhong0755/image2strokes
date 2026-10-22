@@ -1,0 +1,24 @@
+name: engine
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 语法检查
+        run: |
+          for f in js/*.js; do node --check "$f"; done
+
+      - name: 稳定入口与引擎契约
+        run: node dev/engine_check.mjs

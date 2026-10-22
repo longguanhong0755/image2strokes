@@ -115,7 +115,7 @@ function startExtract(imgCanvas) {
   };
   targetMs = opts.targetSec * 1000;
   if (!worker) {
-    worker = new Worker('js/worker.js?v=9');
+    worker = new Worker('js/worker.js?v=21');
     worker.onmessage = onWorker;
     worker.onerror = (e) => { setExtracting(false); note('出错：' + e.message, 'err'); };
   }
