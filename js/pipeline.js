@@ -6500,6 +6500,34 @@
             const lp = new Int32Array(G_).fill(-1);
             const lf = (i) => { let r0 = i; while (lp[r0] >= 0) r0 = lp[r0]; return r0; };
             const lu = (a, b) => { a = lf(a); b = lf(b); if (a === b) return; if (lp[a] > lp[b]) { const t = a; a = b; b = t; } lp[a] += lp[b]; lp[b] = a; };
+            // 线簇的几何与面积也参与并查集。只按“相邻且同色”会让扫描件的
+            // 外框、抗锯齿边和纸纹通过一个接一个的近距离关系串成横跨整页
+            // 的巨型对象；之后它会在主体阶段反复东补一笔西补一笔。
+            const lbb = new Map(looseLines.map((g) => [g.gid, {
+              x0: g.x0, y0: g.y0, x1: g.x1, y1: g.y1, area: g.area,
+            }]));
+            const maxLineW = W * 0.38, maxLineH = H * 0.24, maxLineA = N * 0.025;
+            const lineUnionOk = (a, b) => {
+              const A = lbb.get(lf(a)), B = lbb.get(lf(b));
+              if (!A || !B) return false;
+              const x0 = Math.min(A.x0, B.x0), y0 = Math.min(A.y0, B.y0);
+              const x1 = Math.max(A.x1, B.x1), y1 = Math.max(A.y1, B.y1);
+              return x1 - x0 + 1 <= maxLineW && y1 - y0 + 1 <= maxLineH &&
+                A.area + B.area <= maxLineA;
+            };
+            const luBounded = (a, b) => {
+              const ra = lf(a), rb = lf(b);
+              if (ra === rb || !lineUnionOk(a, b)) return false;
+              const A = lbb.get(ra), B = lbb.get(rb);
+              lu(ra, rb);
+              const root = lf(ra);
+              lbb.set(root, {
+                x0: Math.min(A.x0, B.x0), y0: Math.min(A.y0, B.y0),
+                x1: Math.max(A.x1, B.x1), y1: Math.max(A.y1, B.y1),
+                area: A.area + B.area,
+              });
+              return true;
+            };
             // 无主细线不再跨整页做像素连通：扫描件里边框、标题和装饰线
             // 常通过 1px 抗锯齿边缘串在一起。只合并真正贴近且同色的线段，
             // 行级文字交给后面的“同一行”合并，避免整页细线变回一个对象。
@@ -6512,7 +6540,7 @@
                 const dy = Math.max(0, Math.max(A.y0 - B.y1, B.y0 - A.y1));
                 if (Math.hypot(dx, dy) > lineGap) continue;
                 if (mx3(A.mean, B.mean) > 32) continue;
-                lu(A.gid, B.gid);
+                luBounded(A.gid, B.gid);
               }
             }
             const lmap = new Map();
@@ -6628,7 +6656,10 @@
             if (o.backdrop) return 0;
             // 大面积、成片的前景层（山体、水面、主体底座）先铺；鸟/云纹/反光
             // 这类小对象后画，避免中途出现"细节先出现、大片还没铺"的白洞。
-            if (o.area >= N * 0.03 && bw * bh >= N * 0.02 && fill >= 0.22) return 1;
+            // 不能只看包围盒填充率：窗框、圆底板、杯身等对象常由多块同色面
+            // 和内部镂空组成，fill 会偏低，但它们仍然是应在文字/细节之前完成的
+            // 大形体。面积足够大且确实有连续色面时先画。
+            if (o.area >= N * 0.018 && fill >= 0.10) return 1;
             if (o.area >= N * 0.002) return 2;
             return 3;
           };
