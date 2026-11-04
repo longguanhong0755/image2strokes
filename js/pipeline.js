@@ -6086,7 +6086,47 @@
         await yieldUI();
         let handX = W * (0.5 + (srnd(11.7, 8.1) - 0.5) * 0.22);
         let handY = H * (0.5 + (srnd(13.1, 8.9) - 0.5) * 0.22);
+        // 构图底色先落一层：大面积背景块各用一到两笔带过，先把海报的上下
+        // 版面、风景的天空/水面、窗玻璃等大关系立住。等整页底色刷完才看到
+        // 蓝色版面，回放前半段会像在空纸上磨时间。这里只碰 bgSet 的大块，
+        // 不碰文字、花、猫脸等前景；后续 flood/细化仍会逐像素校正。
+        {
+          const preBg = groups.filter((g) => bgSet[g.gid] && !g.lineLike && g.area >= N * 0.04)
+            .sort((a, b) => b.area - a.area);
+          for (const g of preBg) {
+            const bw = g.bw, bh = g.bh;
+            const m = new Uint8Array(bw * bh);
+            let mn = 0;
+            for (let y = g.y0; y <= g.y1; y++) {
+              const row = y * W, mr = (y - g.y0) * bw;
+              for (let x = g.x0; x <= g.x1; x++) {
+                if (groupOf[row + x] !== g.gid) continue;
+                m[mr + x - g.x0] = 1; mn++;
+              }
+            }
+            if (mn < 64) continue;
+            const ax = bw >= bh;
+            const hw = Math.max(5, Math.min(48 * scaleB, (ax ? bh : bw) * 0.42));
+            const n = (ax ? bh : bw) > hw * 2.1 ? 2 : 1;
+            for (let si = 0; si < n; si++) {
+              const off = n === 1 ? 0 : (si === 0 ? -hw * 0.55 : hw * 0.55);
+              const p0 = ax ? [g.x0 - hw * 0.4, g.cy + off] : [g.cx + off, g.y0 - hw * 0.4];
+              const p1 = ax ? [g.x1 + hw * 0.4, g.cy + off] : [g.cx + off, g.y1 + hw * 0.4];
+              const st = emitStroke(new Float64Array([p0[0], p0[1], p1[0], p1[1]]),
+                new Float64Array([hw, hw]), g.mean, 0, {
+                  pen: 0, zoneMaskRect: { m, x0: g.x0, y0: g.y0, w: bw, h: bh },
+                  noCover: 1, minInk: 1, ms: 90 + Math.max(bw, bh) * 0.25,
+                });
+              if (st >= 0) strokes[st].fl = 1;
+            }
+          }
+          if (preBg.length) await yieldUI();
+        }
+        const floodS0 = strokes.length;
         const flood = await paintBgFlood(frameFam);
+        // 铺底是手臂快速带过，不是逐笔精修；否则中段会长时间停在单色纸面，
+        // 真正的构图和主体要等到回放很后面才出现。
+        for (let i = floodS0; i < strokes.length; i++) strokes[i].ms *= 0.28;
         const bgFloodOk = flood.ok;
         painterBgFill = bgFloodOk ? 'once' : 'wash';
         if (flood.ok) {
@@ -6142,14 +6182,18 @@
           if (bn > N * 0.03) {
             const tile = Math.max(28, Math.min(56, Math.round(Math.min(W, H) * 0.045)));
             const stepX = Math.max(36, Math.round(tile * 1.55));
-            const brushH = tile * 0.64;
+            const brushH = tile * 0.72;
             let underN = 0;
             for (let y = 0; y < H; y += tile) {
               const y0 = y, y1 = Math.min(H - 1, y + tile - 1);
               const yc = (y0 + y1) * 0.5;
               for (let x = 0; x < W; x += stepX) {
                 const x0 = x, x1 = Math.min(W - 1, x + stepX - 1);
-                let sr = 0, sg = 0, sb = 0, sn = 0, tot = 0;
+                // 先找这一块里占主导的背景色组。取局部均值会把窗玻璃、墙面、
+                // 水面和前景混成一块灰绿/灰蓝色，回放中段看起来像马赛克；同一
+                // 色组始终使用组均值，并把笔裁在该组自己的像素内，颜色才连续。
+                const cnt = new Map();
+                let tot = 0;
                 for (let yy = y0; yy <= y1; yy += 2) {
                   const row = yy * W;
                   for (let xx = x0; xx <= x1; xx += 2) {
@@ -6157,14 +6201,26 @@
                     if (segPaper[p]) continue;
                     tot++;
                     if (!bm[p]) continue;
-                    sr += R[p]; sg += G[p]; sb += B[p]; sn++;
+                    const gid = groupOf[p];
+                    if (gid >= 0) cnt.set(gid, (cnt.get(gid) || 0) + 1);
                   }
                 }
-                // 背景瓦片里的前景细节不必先留白：人刷水面/窗玻璃时会顺手盖过去，
-                // 再把反光、花、杯子画在上面。以背景像素占比判断瓦片属于大片底板，
-                // 够连续就把整块非纸面先铺上背景色；真正独立的小物体不会达到比例。
-                if (sn < 18 || sn / Math.max(1, tot) < 0.30) continue;
-                const col = [Math.round(sr / sn), Math.round(sg / sn), Math.round(sb / sn)];
+                let bestGid = -1, bestN = 0;
+                for (const [gid, n] of cnt) if (n > bestN) { bestN = n; bestGid = gid; }
+                if (bestGid < 0 || bestN / Math.max(1, tot) < 0.30) continue;
+                const tg = groups[bestGid];
+                const tw = x1 - x0 + 1, th = y1 - y0 + 1;
+                const tm = new Uint8Array(tw * th);
+                let mn = 0;
+                for (let yy = y0; yy <= y1; yy++) {
+                  const row = yy * W, mr = (yy - y0) * tw;
+                  for (let xx = x0; xx <= x1; xx++) {
+                    const p = row + xx;
+                    if (!bm[p] || groupOf[p] !== bestGid) continue;
+                    tm[mr + xx - x0] = 1; mn++;
+                  }
+                }
+                if (mn < 16) continue;
                 const nP = 4;
                 const sp = new Float64Array(nP * 2), halfs = new Float64Array(nP);
                 const left = x0 - brushH * 0.55, right = x1 + brushH * 0.55;
@@ -6175,17 +6231,18 @@
                   sp[k * 2 + 1] = yc + bow * Math.sin(Math.PI * f);
                   halfs[k] = brushH * (0.94 + 0.08 * srnd(x0 + y0 * 0.37 + k * 1.7, 3.9));
                 }
-                const si = emitStroke(sp, halfs, col, 0, {
-                  pen: 0, zoneMask: bm, noCover: 1, minInk: 1,
-                  ms: 0.1 + (x1 - x0) * 0.001,
+                const si = emitStroke(sp, halfs, tg.mean, 0, {
+                  pen: 0, zoneMaskRect: { m: tm, x0, y0, w: tw, h: th },
+                  noCover: 1, minInk: 1,
+                  ms: 0.08 + (x1 - x0) * 0.001,
                 });
                 if (si >= 0) { strokes[si].fl = 1; underN++; }
               }
               if ((y / tile) % 4 === 0) await yieldUI();
             }
-            // 大面积背景的内部孔洞（水面反光、窗里的花、插图中的脸）先用该背景组
-            // 的均值补成连续大面，之后主体再覆盖上去。按整行跨度补孔而不是按瓦片
-            // 均值，能保持同一底板的色相连续，不会出现方块状色差。
+            // 背景内部允许补的只是同一色组之间的窄缝（窗棂/反光/文字边），
+            // 不再把整行首尾之间的前景连同背景一起刷掉。这样猫脸、花、杯子
+            // 不会被背景色块提前盖住，水面和窗玻璃的小白缝仍能连续。
             const holeGroups = groups.filter((g) => bgSet[g.gid] && !g.lineLike && g.area >= N * 0.02)
               .sort((a, b) => b.area - a.area);
             let holeStrokes = 0;
@@ -6193,26 +6250,30 @@
               const bw = g.bw, bh = g.bh;
               const hm = new Uint8Array(bw * bh);
               let markN = 0;
+              const maxGap = Math.max(18, Math.min(72 * scaleB, bh * 0.30));
               for (let y = g.y0; y <= g.y1; y++) {
-                let xl = -1, xr = -1, gn = 0;
+                let prev = -1;
+                const mr = (y - g.y0) * bw;
                 for (let x = g.x0; x <= g.x1; x++) {
                   const p = y * W + x;
                   if (groupOf[p] !== g.gid || !bm[p]) continue;
-                  gn++;
-                  if (xl < 0) xl = x;
-                  xr = x;
-                }
-                if (xl < 0) continue;
-                const span = xr - xl + 1;
-                if (span < 16 || gn / span < 0.45) continue;
-                const mr = (y - g.y0) * bw;
-                for (let x = xl; x <= xr; x++) {
-                  const p = y * W + x;
-                  if (segPaper[p] || paintN[p] || covered[p]) continue;
-                  hm[mr + x - g.x0] = 1; markN++;
+                  if (prev >= 0) {
+                    const gap = x - prev - 1;
+                    if (gap > 0 && gap <= maxGap) {
+                      for (let xx = prev + 1; xx < x; xx++) {
+                        const q = y * W + xx;
+                        if (segPaper[q] || paintN[q] || covered[q]) continue;
+                        const qg = groupOf[q];
+                        // 大块前景不属于背景缝隙；只让扫描噪点/抗锯齿/无主像素被带过。
+                        if (qg >= 0 && !bgSet[qg] && groups[qg] && groups[qg].area >= N * 0.0004) continue;
+                        hm[mr + xx - g.x0] = 1; markN++;
+                      }
+                    }
+                  }
+                  prev = x;
                 }
               }
-              if (markN < Math.max(64, g.area * 0.04)) continue;
+              if (markN < Math.max(64, g.area * 0.02)) continue;
               const halfH = Math.max(5, Math.min(46 * scaleB, bh * 0.16));
               const k = Math.max(1, Math.ceil(bh / (halfH * 1.12)));
               for (let i = 0; i < k; i++) {
@@ -6221,7 +6282,7 @@
                 const halfs = new Float64Array([halfH, halfH]);
                 const si = emitStroke(sp, halfs, g.mean, 0, {
                   pen: 0, zoneMaskRect: { m: hm, x0: g.x0, y0: g.y0, w: bw, h: bh },
-                  noCover: 1, minInk: 1, ms: 0.15,
+                  noCover: 1, minInk: 1, ms: 0.12,
                 });
                 if (si >= 0) { strokes[si].fl = 1; holeStrokes++; }
               }
@@ -6441,10 +6502,63 @@
             }
             for (const o of lmap.values()) cmap.set(100000 + roots.length + cmap.size, o);
           }
-          const out = [...cmap.values()];
+          let out = [...cmap.values()];
           for (const o of out) {
             o.cx = (o.x0 + o.x1) * 0.5; o.cy = (o.y0 + o.y1) * 0.5;
             o.gs.sort((a, b) => b.area - a.area);
+          }
+          // 文字行、窗格等“同一横排、同色、近邻”的块合成一个对象。否则
+          // 一个标题会在几十秒里只出现几个字母，下一行又穿插进来，像机器
+          // 按面积逐块扫描；合并后是一行写完再写下一行。
+          {
+            const n0 = out.length;
+            const par2 = new Int32Array(n0).fill(-1);
+            const find2 = (i) => { let r = i; while (par2[r] >= 0) r = par2[r]; return r; };
+            const uni2 = (a, b) => {
+              a = find2(a); b = find2(b); if (a === b) return;
+              if (par2[a] > par2[b]) { const t = a; a = b; b = t; }
+              par2[a] += par2[b]; par2[b] = a;
+            };
+            const mean2 = (o) => {
+              let sr = 0, sg = 0, sb = 0, n = 0;
+              for (const g of o.gs) {
+                if (g.lineLike) continue;
+                sr += g.mean[0] * g.area; sg += g.mean[1] * g.area; sb += g.mean[2] * g.area;
+                n += g.area;
+              }
+              if (!n) for (const g of o.gs) {
+                sr += g.mean[0] * g.area; sg += g.mean[1] * g.area; sb += g.mean[2] * g.area;
+                n += g.area;
+              }
+              return n ? [sr / n, sg / n, sb / n] : [0, 0, 0];
+            };
+            const cm = out.map(mean2);
+            for (let i = 0; i < n0; i++) {
+              const A = out[i], hA = A.y1 - A.y0 + 1;
+              for (let j = i + 1; j < n0; j++) {
+                const B = out[j], hB = B.y1 - B.y0 + 1;
+                const minH = Math.min(hA, hB), maxH = Math.max(hA, hB);
+                const yov = Math.min(A.y1, B.y1) - Math.max(A.y0, B.y0) + 1;
+                const gapX = Math.max(0, Math.max(A.x0 - B.x1, B.x0 - A.x1));
+                const rowBand = yov >= minH * 0.45 && Math.abs(A.cy - B.cy) <= maxH * 0.48;
+                const near = gapX <= Math.max(10, Math.min(Math.min(W, H) * 0.045, minH * 3.2));
+                const dc = Math.max(Math.abs(cm[i][0] - cm[j][0]), Math.abs(cm[i][1] - cm[j][1]),
+                  Math.abs(cm[i][2] - cm[j][2]));
+                if (rowBand && near && dc <= 48) uni2(i, j);
+              }
+            }
+            const mmap = new Map();
+            for (let i = 0; i < n0; i++) {
+              const r = find2(i);
+              let o = mmap.get(r);
+              if (!o) { o = { gids: [], gs: [], area: 0, x0: W, y0: H, x1: -1, y1: -1 }; mmap.set(r, o); }
+              for (const g of out[i].gs) addToObj(o, g);
+            }
+            out = [...mmap.values()];
+            for (const o of out) {
+              o.cx = (o.x0 + o.x1) * 0.5; o.cy = (o.y0 + o.y1) * 0.5;
+              o.gs.sort((a, b) => b.area - a.area);
+            }
           }
           // 大块、高填充率的色板是构图背板（例如海报里占大半幅的蓝色版面），
           // 即使不是主色家族，也必须先铺，再在其上画飞机/圆/文字。否则会先画出
