@@ -5852,12 +5852,46 @@
           }
         }
         const bwP = bx1 - bx0 + 1, bhP = by1 - by0 + 1;
-        // 版面矩形掩膜：笔画只裁在版面内，出界不落墨；纸白像素不刷
-        // （插画的白纸底本来就是这个颜色，刷一层背景均值反而会染成暖白）
+        // 主色底不是整张矩形：它只铺到“与主色背景连成一片、且没有被
+        // 其它大背板隔断”的区域。这样海报标题/底色上的图形会被底色
+        // 自然盖过，而像 FLY 上半幅深蓝版面、窗玻璃这类独立背板不会被
+        // 主色横刷误盖，回放中段不会先出现一整块错误颜色。
+        const blockG = new Uint8Array(G_);
+        for (const g of groups) {
+          if (frameFam[g.gid] ||
+            (bgFirstPlan.bgSet[g.gid] && !bgFirstPlan.famGid[g.gid]) ||
+            (!bgFirstPlan.bgSet[g.gid] && g.area > N * 0.025)) blockG[g.gid] = 1;
+        }
+        const baseRegion = new Uint8Array(N);
+        const baseQ = new Int32Array(N);
+        let baseHead = 0, baseTail = 0;
+        for (let y = by0; y <= by1; y++) {
+          const row = y * W;
+          for (let x = bx0; x <= bx1; x++) {
+            const p = row + x;
+            if (!blue[p]) continue;
+            baseRegion[p] = 1; baseQ[baseTail++] = p;
+          }
+        }
+        while (baseHead < baseTail) {
+          const p = baseQ[baseHead++], x = p % W, y = (p - x) / W;
+          const visit = (q) => {
+            if (q < 0 || q >= N || baseRegion[q] || segPaper[q]) return;
+            const qx = q % W;
+            if (qx < bx0 || qx > bx1 || q < by0 * W || q >= (by1 + 1) * W) return;
+            const gid = groupOf[q];
+            if (gid < 0 || blockG[gid]) return;
+            baseRegion[q] = 1; baseQ[baseTail++] = q;
+          };
+          if (x > bx0) visit(p - 1);
+          if (x < bx1) visit(p + 1);
+          if (y > by0) visit(p - W);
+          if (y < by1) visit(p + W);
+        }
         const page = new Uint8Array(bwP * bhP);
         for (let y = by0; y <= by1; y++) {
           const row = y * W, mr = (y - by0) * bwP;
-          for (let x = bx0; x <= bx1; x++) page[mr + x - bx0] = segPaper[row + x] ? 0 : 1;
+          for (let x = bx0; x <= bx1; x++) page[mr + x - bx0] = baseRegion[row + x] ? 1 : 0;
         }
         const zoneRect = { m: page, x0: bx0, y0: by0, w: bwP, h: bhP };
         const stripH = Math.max(10, Math.min(32, Math.round(Math.min(W, H) * 0.022)));
@@ -6435,11 +6469,6 @@
           // 没有直接邻接时按 bbox 距离找最近对象，避免孤立轮廓落到片尾。
           const roots = [...cmap.keys()];
           const rootObj = new Map(roots.map((r) => [r, cmap.get(r)]));
-          const objDist = (o, g) => {
-            const dx = Math.max(0, Math.max(o.x0 - g.x1, g.x0 - o.x1));
-            const dy = Math.max(0, Math.max(o.y0 - g.y1, g.y0 - o.y1));
-            return Math.hypot(dx, dy);
-          };
           const looseLines = [];
           for (let gid = 0; gid < G_; gid++) {
             if (!fg[gid] || !groups[gid].lineLike) continue;
@@ -6463,14 +6492,6 @@
             }
             let bestRoot = -1, bestVote = 0;
             for (const [rt, v] of votes) if (v > bestVote) { bestVote = v; bestRoot = rt; }
-            if (bestRoot < 0 && roots.length) {
-              let bd = Infinity;
-              for (const rt of roots) {
-                const d = objDist(rootObj.get(rt), g);
-                if (d < bd) { bd = d; bestRoot = rt; }
-              }
-              if (bd > Math.max(24, Math.min(W, H) * 0.035)) bestRoot = -1;
-            }
             if (bestRoot >= 0) addToObj(rootObj.get(bestRoot), g);
             else looseLines.push(g);
           }
@@ -6479,18 +6500,19 @@
             const lp = new Int32Array(G_).fill(-1);
             const lf = (i) => { let r0 = i; while (lp[r0] >= 0) r0 = lp[r0]; return r0; };
             const lu = (a, b) => { a = lf(a); b = lf(b); if (a === b) return; if (lp[a] > lp[b]) { const t = a; a = b; b = t; } lp[a] += lp[b]; lp[b] = a; };
-            const lset = new Uint8Array(G_);
-            for (const g of looseLines) lset[g.gid] = 1;
-            for (const g of looseLines) {
-              const gid = g.gid;
-              for (let y = g.y0; y <= g.y1; y++) {
-                const row = y * W;
-                for (let x = g.x0; x <= g.x1; x++) {
-                  const p = row + x;
-                  if (groupOf[p] !== gid) continue;
-                  if (x + 1 < W) { const b = groupOf[p + 1]; if (b >= 0 && lset[b]) lu(gid, b); }
-                  if (y + 1 < H) { const b = groupOf[p + W]; if (b >= 0 && lset[b]) lu(gid, b); }
-                }
+            // 无主细线不再跨整页做像素连通：扫描件里边框、标题和装饰线
+            // 常通过 1px 抗锯齿边缘串在一起。只合并真正贴近且同色的线段，
+            // 行级文字交给后面的“同一行”合并，避免整页细线变回一个对象。
+            const lineGap = Math.max(2, Math.min(W, H) * 0.006);
+            for (let i = 0; i < looseLines.length; i++) {
+              const A = looseLines[i];
+              for (let j = i + 1; j < looseLines.length; j++) {
+                const B = looseLines[j];
+                const dx = Math.max(0, Math.max(A.x0 - B.x1, B.x0 - A.x1));
+                const dy = Math.max(0, Math.max(A.y0 - B.y1, B.y0 - A.y1));
+                if (Math.hypot(dx, dy) > lineGap) continue;
+                if (mx3(A.mean, B.mean) > 32) continue;
+                lu(A.gid, B.gid);
               }
             }
             const lmap = new Map();
@@ -6507,6 +6529,18 @@
             o.cx = (o.x0 + o.x1) * 0.5; o.cy = (o.y0 + o.y1) * 0.5;
             o.gs.sort((a, b) => b.area - a.area);
           }
+          if (opts.debug) {
+            for (const o of out.slice().sort((a,b)=>b.area-a.area).slice(0,4)) {
+              const qc = new Map(); let lineN=0, fillN=0;
+              for (const g of o.gs) { if(g.lineLike) lineN+=g.area; else fillN+=g.area; const k=g.mean.map(v=>Math.round(v/32)*32).join(','); qc.set(k,(qc.get(k)||0)+g.area); }
+              console.log('[objdetail] area='+o.area+' g='+o.gs.length+' line='+lineN+' fill='+fillN+' colors='+[...qc.entries()].sort((a,b)=>b[1]-a[1]).slice(0,8).map(([k,v])=>k+':'+v).join('|'));
+            }
+          }
+          if (opts.debug) {
+            const oo = out.slice().sort((a,b)=>b.area-a.area)[0];
+            console.log('[objgroups] ' + oo.gs.slice().sort((a,b)=>b.area-a.area).slice(0,30).map((g)=>g.gid+':'+g.area+'@['+g.x0+','+g.y0+','+g.x1+','+g.y1+']/'+g.mean.map(Math.round).join(',')+(g.lineLike?'L':'F')).join(' '));
+          }
+          if (opts.debug) console.log('[objpre] n=' + out.length + ' top=' + out.slice().sort((a,b)=>b.area-a.area).slice(0,12).map((o)=>o.area+'@'+o.gids.length+':['+o.x0+','+o.y0+','+o.x1+','+o.y1+']').join(' '));
           // 文字行、窗格等“同一横排、同色、近邻”的块合成一个对象。否则
           // 一个标题会在几十秒里只出现几个字母，下一行又穿插进来，像机器
           // 按面积逐块扫描；合并后是一行写完再写下一行。
@@ -6533,18 +6567,34 @@
               return n ? [sr / n, sg / n, sb / n] : [0, 0, 0];
             };
             const cm = out.map(mean2);
+            const info = out.map((o) => {
+              const w = o.x1 - o.x0 + 1, h = o.y1 - o.y0 + 1;
+              let lineA = 0;
+              for (const g of o.gs) if (g.lineLike) lineA += g.area;
+              return { w, h, lineShare: lineA / Math.max(1, o.area) };
+            });
             for (let i = 0; i < n0; i++) {
-              const A = out[i], hA = A.y1 - A.y0 + 1;
+              const A = out[i], a = info[i];
+              // 只允许“单个字/词”级别的横向小块参与行合并。整页边框、
+              // 大面积色板、跨越半幅的装饰线一旦参与，近邻关系会把它们
+              // 和所有文字串成一个巨型对象，回放又退化成全图扫块。
+              const aLeaf = a.w <= W * 0.32 && a.h <= H * 0.15 && A.area <= N * 0.09;
+              if (!aLeaf) continue;
               for (let j = i + 1; j < n0; j++) {
-                const B = out[j], hB = B.y1 - B.y0 + 1;
-                const minH = Math.min(hA, hB), maxH = Math.max(hA, hB);
+                const B = out[j], b = info[j];
+                const bLeaf = b.w <= W * 0.32 && b.h <= H * 0.15 && B.area <= N * 0.09;
+                if (!bLeaf) continue;
+                const minH = Math.min(a.h, b.h), maxH = Math.max(a.h, b.h);
                 const yov = Math.min(A.y1, B.y1) - Math.max(A.y0, B.y0) + 1;
                 const gapX = Math.max(0, Math.max(A.x0 - B.x1, B.x0 - A.x1));
-                const rowBand = yov >= minH * 0.45 && Math.abs(A.cy - B.cy) <= maxH * 0.48;
-                const near = gapX <= Math.max(10, Math.min(Math.min(W, H) * 0.045, minH * 3.2));
+                const rowBand = yov >= minH * 0.55 && Math.abs(A.cy - B.cy) <= maxH * 0.42;
+                const near = gapX <= Math.max(8, Math.min(W * 0.04, minH * 2.8));
+                const heightOk = maxH <= minH * 2.2 && Math.max(a.h, b.h) <= H * 0.16 &&
+                  Math.max(a.w, b.w) + gapX <= W * 0.92;
+                const areaOk = Math.max(A.area, B.area) <= Math.max(24, Math.min(A.area, B.area) * 12);
                 const dc = Math.max(Math.abs(cm[i][0] - cm[j][0]), Math.abs(cm[i][1] - cm[j][1]),
                   Math.abs(cm[i][2] - cm[j][2]));
-                if (rowBand && near && dc <= 48) uni2(i, j);
+                if (rowBand && near && heightOk && areaOk && dc <= 38) uni2(i, j);
               }
             }
             const mmap = new Map();
@@ -6555,6 +6605,7 @@
               for (const g of out[i].gs) addToObj(o, g);
             }
             out = [...mmap.values()];
+            if (opts.debug) console.log('[objrow] n=' + out.length + ' top=' + out.slice().sort((a,b)=>b.area-a.area).slice(0,12).map((o)=>o.area+'@'+o.gids.length+':['+o.x0+','+o.y0+','+o.x1+','+o.y1+']').join(' '));
             for (const o of out) {
               o.cx = (o.x0 + o.x1) * 0.5; o.cy = (o.y0 + o.y1) * 0.5;
               o.gs.sort((a, b) => b.area - a.area);
