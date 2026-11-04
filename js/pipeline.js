@@ -5823,14 +5823,20 @@
           if (x < bx0) bx0 = x; if (x > bx1) bx1 = x;
           if (y < by0) by0 = y; if (y > by1) by1 = y;
         }
-        if (opts.debug) console.log('[bgflood] famN=' + (blueN / N * 100).toFixed(1) + '% edges=' +
-          bgFirstPlan.famEdges + ' spread=' + bgFirstPlan.famSpread.toFixed(1));
         const bwN = bx1 - bx0 + 1, bhN = by1 - by0 + 1;
-        // 背景 = 主色族里"铺满整页"的那一块：贴 ≥3 条画布边，或被一圈细框包住
-        // （b71 的海报四周有黑框，蓝底本身不贴画布边）。渐变/碎色底由 spread 挡掉。
+        const rectFill = blueN / Math.max(1, bwN * bhN);
+        if (opts.debug) console.log('[bgflood] famN=' + (blueN / N * 100).toFixed(1) + '% edges=' +
+          bgFirstPlan.famEdges + ' spread=' + bgFirstPlan.famSpread.toFixed(1) +
+          ' rectFill=' + (rectFill * 100).toFixed(1) + '%');
+        // 背景 = 主色族里真正"铺满整页"的那一块。贴边数只能证明它碰到了画布边缘，
+        // 不能证明它是页面：例如窗边插画的下半幅地面会同时碰到左、右、下三边，
+        // 但只填满自身包围盒的一半。这里再要求包围盒内的高填充率，避免把横向
+        // 地面/色带误当成整页底色而横贯全图重扫。四周有细框的海报仍由 pageLike
+        // 处理；渐变/碎色底继续由 spread 挡掉。
         const pageLike = bwN >= W * 0.6 && bhN >= H * 0.6;
+        const edgePageLike = bgFirstPlan.famEdges >= 3 && rectFill >= 0.62;
         if (blueN < N * 0.15 || bx1 < 0 || bgFirstPlan.famSpread > 12 ||
-          !(pageLike || bgFirstPlan.famEdges >= 3)) {
+          !(pageLike || edgePageLike)) {
           return { ok: false, x: W * 0.5, y: H * 0.5 };
         }
         // 取色用的"纯蓝芯"：3×3 邻域全是蓝的像素。字的抗锯齿边是蓝底+奶油混出来的
@@ -6136,23 +6142,28 @@
           if (bn > N * 0.03) {
             const tile = Math.max(28, Math.min(56, Math.round(Math.min(W, H) * 0.045)));
             const stepX = Math.max(36, Math.round(tile * 1.55));
-            const brushH = tile * 0.58;
+            const brushH = tile * 0.64;
             let underN = 0;
             for (let y = 0; y < H; y += tile) {
               const y0 = y, y1 = Math.min(H - 1, y + tile - 1);
               const yc = (y0 + y1) * 0.5;
               for (let x = 0; x < W; x += stepX) {
                 const x0 = x, x1 = Math.min(W - 1, x + stepX - 1);
-                let sr = 0, sg = 0, sb = 0, sn = 0;
+                let sr = 0, sg = 0, sb = 0, sn = 0, tot = 0;
                 for (let yy = y0; yy <= y1; yy += 2) {
                   const row = yy * W;
                   for (let xx = x0; xx <= x1; xx += 2) {
                     const p = row + xx;
+                    if (segPaper[p]) continue;
+                    tot++;
                     if (!bm[p]) continue;
                     sr += R[p]; sg += G[p]; sb += B[p]; sn++;
                   }
                 }
-                if (sn < 18) continue;
+                // 背景瓦片里的前景细节不必先留白：人刷水面/窗玻璃时会顺手盖过去，
+                // 再把反光、花、杯子画在上面。以背景像素占比判断瓦片属于大片底板，
+                // 够连续就把整块非纸面先铺上背景色；真正独立的小物体不会达到比例。
+                if (sn < 18 || sn / Math.max(1, tot) < 0.30) continue;
                 const col = [Math.round(sr / sn), Math.round(sg / sn), Math.round(sb / sn)];
                 const nP = 4;
                 const sp = new Float64Array(nP * 2), halfs = new Float64Array(nP);
@@ -6166,14 +6177,58 @@
                 }
                 const si = emitStroke(sp, halfs, col, 0, {
                   pen: 0, zoneMask: bm, noCover: 1, minInk: 1,
-                  dither: 1.8, ditherSeed: x0 * 0.13 + y0 * 0.19 + runSeed * 0.31,
                   ms: 0.1 + (x1 - x0) * 0.001,
                 });
                 if (si >= 0) { strokes[si].fl = 1; underN++; }
               }
               if ((y / tile) % 4 === 0) await yieldUI();
             }
-            if (opts.debug) console.log('[underlay] bgPx=' + bn + ' tile=' + tile + ' strokes=' + underN);
+            // 大面积背景的内部孔洞（水面反光、窗里的花、插图中的脸）先用该背景组
+            // 的均值补成连续大面，之后主体再覆盖上去。按整行跨度补孔而不是按瓦片
+            // 均值，能保持同一底板的色相连续，不会出现方块状色差。
+            const holeGroups = groups.filter((g) => bgSet[g.gid] && !g.lineLike && g.area >= N * 0.02)
+              .sort((a, b) => b.area - a.area);
+            let holeStrokes = 0;
+            for (const g of holeGroups) {
+              const bw = g.bw, bh = g.bh;
+              const hm = new Uint8Array(bw * bh);
+              let markN = 0;
+              for (let y = g.y0; y <= g.y1; y++) {
+                let xl = -1, xr = -1, gn = 0;
+                for (let x = g.x0; x <= g.x1; x++) {
+                  const p = y * W + x;
+                  if (groupOf[p] !== g.gid || !bm[p]) continue;
+                  gn++;
+                  if (xl < 0) xl = x;
+                  xr = x;
+                }
+                if (xl < 0) continue;
+                const span = xr - xl + 1;
+                if (span < 16 || gn / span < 0.45) continue;
+                const mr = (y - g.y0) * bw;
+                for (let x = xl; x <= xr; x++) {
+                  const p = y * W + x;
+                  if (segPaper[p] || paintN[p] || covered[p]) continue;
+                  hm[mr + x - g.x0] = 1; markN++;
+                }
+              }
+              if (markN < Math.max(64, g.area * 0.04)) continue;
+              const halfH = Math.max(5, Math.min(46 * scaleB, bh * 0.16));
+              const k = Math.max(1, Math.ceil(bh / (halfH * 1.12)));
+              for (let i = 0; i < k; i++) {
+                const yc = g.y0 + bh * (i + 0.5) / k;
+                const sp = new Float64Array([g.x0 - 2, yc, g.x1 + 2, yc]);
+                const halfs = new Float64Array([halfH, halfH]);
+                const si = emitStroke(sp, halfs, g.mean, 0, {
+                  pen: 0, zoneMaskRect: { m: hm, x0: g.x0, y0: g.y0, w: bw, h: bh },
+                  noCover: 1, minInk: 1, ms: 0.15,
+                });
+                if (si >= 0) { strokes[si].fl = 1; holeStrokes++; }
+              }
+              if ((holeStrokes & 31) === 0) await yieldUI();
+            }
+            if (opts.debug) console.log('[underlay] bgPx=' + bn + ' tile=' + tile +
+              ' strokes=' + underN + ' hole=' + holeStrokes);
           }
         }
         if (flood.ok) {
@@ -6239,7 +6294,7 @@
             paintFull(g, 1);
             // 背景补准是铺完底色后的顺手收拾，不是主体刻画。压缩这些小笔
             // 的相对时长，让大背板和主体不要等到回放过半才出现。
-            for (let i = bs; i < strokes.length; i++) strokes[i].ms *= 0.52;
+            for (let i = bs; i < strokes.length; i++) strokes[i].ms *= 0.24;
             handX = g.cx; handY = g.cy;
             if (((bgDone++) & 15) === 0) {
               prog(0.70 + 0.16 * bgDone / Math.max(1, bgChain.length), '细化背景：整片刷准…');
@@ -7259,7 +7314,10 @@
           // 贴边的低显著度组才是背景；贴边的真实主体（插画右下角的叶子/梗）
           // 显著度高，分组合并后仍带着 border 标记，不能靠 g.bg 混进背景阶段。
           const bgLike = g.bg && (g.sal < 0.62 || g.area > N * 0.02);
-          const famG = fam[gLab[g.gid]] && satOf(g.mean) >= seedSat * 0.6;
+          // 调色板近似会让小花、杯沿等前景落到主色标签上；只有确实被判为
+          // 背景，或本身达到大背板尺度，才允许进入主色背景族。
+          const famG = fam[gLab[g.gid]] && satOf(g.mean) >= seedSat * 0.6 &&
+            (g.bg || g.area >= N * 0.02 || g.sal < 0.65);
           if (famG) { famGid[g.gid] = 1; famN += g.area; }
           if (famG || bgLike || frame || edgeArt) {
             bgSet[g.gid] = 1; bgN += g.area;
@@ -7272,7 +7330,13 @@
         for (const g of groups) {
           if (bgSet[g.gid] || g.lineLike) continue;
           const fill = g.area / Math.max(1, g.bw * g.bh);
-          if (g.area >= N * 0.12 && fill >= 0.50 && g.sal <= 0.40) {
+          // 大背板：面积达到整幅 12%，低显著度。
+          const majorBackdrop = g.area >= N * 0.12 && fill >= 0.50 && g.sal <= 0.40;
+          // 次级底板：窗玻璃、天空分层、舞台侧幕这类贯通的大平涂面。它们不是
+          // 主色家族，但若拖到主体阶段才画，中段会留下整块白洞。高填充率把
+          // 花朵、杯子、小器物等真实前景挡在外面。
+          const panelBackdrop = g.area >= N * 0.02 && fill >= 0.55 && g.sal <= 0.65;
+          if (majorBackdrop || panelBackdrop) {
             bgSet[g.gid] = 1; bgN += g.area; otherBg.push(g);
           }
         }
@@ -7386,7 +7450,9 @@
           // 背景组放宽到 105：蓝底的暗角/旧纸斑偏色也能铺上；黑框、白纸边
           // 明显更远，留到边框阶段。非背景只收 1% 以下的小碎块（噪点/抗锯齿斑），
           // 大块主体不管颜色多接近都留白。
-          if (bgSet[g.gid] ? d <= 105 : (d <= 95 && g.area <= N * 0.01)) washGid[g.gid] = 1;
+          // 非背景组只收亚像素级抗锯齿/扫描噪点。旧阈值会把杯子、书页等
+          // 接近纸色的真实小物体也扫进底色，回放一开始就像先画完了茶具。
+          if (bgSet[g.gid] ? d <= 105 : (d <= 95 && g.area <= N * 0.002)) washGid[g.gid] = 1;
         }
         const washMask = new Uint8Array(N);
         let washN = 0;
