@@ -5854,7 +5854,7 @@
           for (let x = bx0; x <= bx1; x++) page[mr + x - bx0] = segPaper[row + x] ? 0 : 1;
         }
         const zoneRect = { m: page, x0: bx0, y0: by0, w: bwP, h: bhP };
-        const stripH = Math.max(12, Math.min(48, Math.round(Math.min(W, H) * 0.03)));
+        const stripH = Math.max(10, Math.min(32, Math.round(Math.min(W, H) * 0.022)));
         const hw = stripH * 0.56;             // 条带略微搭接，刷完不留缝
         // 版面最外一圈（扫描暗边/压痕）：条带取色太粗，留给后面的"收边"用原图色
         // 逐组刷准（仍在同一遍里，绕一圈就完），成品边缘不会啃掉一圈蓝。
@@ -5867,6 +5867,7 @@
         const seen = new Uint8Array(N);
         const bfs = new Int32Array(N);
         let endX = bx1, endY = by1, nStrokes = 0, nFix = 0;
+        let bgSmoothCol = null;
         for (let r = 0; r < rows; r++) {
           const sy = by0 + r * stripH, ey = Math.min(by1, sy + stripH - 1);
           // 每列的主导色组（字形覆盖的列沿用两侧的蓝，不重开一段）
@@ -5926,6 +5927,44 @@
             run.col = [Math.round(sr / sn), Math.round(sg / sn), Math.round(sb / sn)];
             keep.push(run);
           }
+          // 同一横排内如果各段颜色很接近，就统一成这条带的平滑色，避免底座
+          // 被切成一段段矩形色块；真正的横向渐变仍保留分段色。
+          if (keep.length) {
+            let tr = 0, tg = 0, tb = 0, tn = 0;
+            for (const run of keep) {
+              let n = 0;
+              for (let y = sy; y <= ey; y++) {
+                const row = y * W;
+                for (let x = run.x0; x <= run.x1; x++) {
+                  const p = row + x;
+                  if (!core[p]) continue;
+                  tr += R[p]; tg += G[p]; tb += B[p]; n++;
+                }
+              }
+              tn += n;
+            }
+            if (tn) {
+              const stripMean = [Math.round(tr / tn), Math.round(tg / tn), Math.round(tb / tn)];
+              const uniform = keep.every((run) => Math.max(
+                Math.abs(run.col[0] - stripMean[0]),
+                Math.abs(run.col[1] - stripMean[1]),
+                Math.abs(run.col[2] - stripMean[2])) <= 20);
+              if (uniform) {
+                if (bgSmoothCol) {
+                  const dd = Math.max(Math.abs(bgSmoothCol[0] - stripMean[0]),
+                    Math.abs(bgSmoothCol[1] - stripMean[1]),
+                    Math.abs(bgSmoothCol[2] - stripMean[2]));
+                  const a = dd <= 18 ? 0.55 : 0.85;
+                  bgSmoothCol = [
+                    Math.round(bgSmoothCol[0] + (stripMean[0] - bgSmoothCol[0]) * a),
+                    Math.round(bgSmoothCol[1] + (stripMean[1] - bgSmoothCol[1]) * a),
+                    Math.round(bgSmoothCol[2] + (stripMean[2] - bgSmoothCol[2]) * a),
+                  ];
+                } else bgSmoothCol = stripMean;
+                for (const run of keep) run.col = bgSmoothCol;
+              } else bgSmoothCol = stripMean;
+            }
+          }
           // 字/框的空档：左右两段的色线性过渡着刷过去（每 ~60px 一段）。
           // 直接用一侧的颜色会把字的轮廓留在蓝底上；过渡刷过去，字位就和蓝底融成一片。
           const segs = [];
@@ -5975,6 +6014,7 @@
             }
             const si = emitStroke(sp, halfs, seg.col, 0, {
               pen: 0, color: seg.col, zoneMaskRect: zoneRect, noCover: 1, minInk: 8,
+              dither: 2.2, ditherSeed: r * 7.1 + seg.x0 * 0.17 + runSeed * 0.37,
               ms: Math.round(12 + len * 0.35),
             });
             if (si >= 0) { nStrokes++; strokes[si].fl = 1; }
@@ -6120,6 +6160,61 @@
           }
         }
         }
+        // ---- 遍1b 背景粗铺：先把所有背景组用低分辨率块面铺满 ----
+        // 主色 flood 只覆盖一个颜色家族；山体、水面、墙面等次要背景若等逐组精修，
+        // 中段会长时间留白。这里用背景均值做一层 noCover 的块面底稿，只负责
+        // "先把背景铺完整"，不占覆盖账、也不影响后续逐组真实取色。
+        {
+          const bm = new Uint8Array(N);
+          let bn = 0;
+          for (let p = 0; p < N; p++) {
+            const gid = groupOf[p];
+            if (gid >= 0 && !segPaper[p] && !paintN[p] &&
+              (BGP.bgSet[gid] || groups[gid].area <= N * 0.006)) { bm[p] = 1; bn++; }
+          }
+          if (bn > N * 0.03) {
+            const tile = Math.max(28, Math.min(56, Math.round(Math.min(W, H) * 0.045)));
+            const stepX = Math.max(36, Math.round(tile * 1.55));
+            const brushH = tile * 0.58;
+            let underN = 0;
+            for (let y = 0; y < H; y += tile) {
+              const y0 = y, y1 = Math.min(H - 1, y + tile - 1);
+              const yc = (y0 + y1) * 0.5;
+              for (let x = 0; x < W; x += stepX) {
+                const x0 = x, x1 = Math.min(W - 1, x + stepX - 1);
+                let sr = 0, sg = 0, sb = 0, sn = 0;
+                for (let yy = y0; yy <= y1; yy += 2) {
+                  const row = yy * W;
+                  for (let xx = x0; xx <= x1; xx += 2) {
+                    const p = row + xx;
+                    if (!bm[p]) continue;
+                    sr += R[p]; sg += G[p]; sb += B[p]; sn++;
+                  }
+                }
+                if (sn < 18) continue;
+                const col = [Math.round(sr / sn), Math.round(sg / sn), Math.round(sb / sn)];
+                const nP = 4;
+                const sp = new Float64Array(nP * 2), halfs = new Float64Array(nP);
+                const left = x0 - brushH * 0.55, right = x1 + brushH * 0.55;
+                const bow = (srnd(x0 * 0.17 + y0 * 0.11, 8.6) - 0.5) * brushH * 0.24;
+                for (let k = 0; k < nP; k++) {
+                  const f = k / (nP - 1);
+                  sp[k * 2] = left + (right - left) * f;
+                  sp[k * 2 + 1] = yc + bow * Math.sin(Math.PI * f);
+                  halfs[k] = brushH * (0.94 + 0.08 * srnd(x0 + y0 * 0.37 + k * 1.7, 3.9));
+                }
+                const si = emitStroke(sp, halfs, col, 0, {
+                  pen: 0, zoneMask: bm, noCover: 1, minInk: 1,
+                  dither: 1.8, ditherSeed: x0 * 0.13 + y0 * 0.19 + runSeed * 0.31,
+                  ms: 0.1 + (x1 - x0) * 0.001,
+                });
+                if (si >= 0) { strokes[si].fl = 1; underN++; }
+              }
+              if ((y / tile) % 4 === 0) await yieldUI();
+            }
+            if (opts.debug) console.log('[underlay] bgPx=' + bn + ' tile=' + tile + ' strokes=' + underN);
+          }
+        }
         if (flood.ok) {
           // 版面边缘的扫描毛边/抗锯齿组（不是蓝、也不属于黑框带）：趁"铺满"这一遍
           // 顺手收掉，而不是绕完框再回来点，也不是留到尾声变成上千个小点。
@@ -6175,12 +6270,8 @@
         // 蓝色斑纹）再按原色补准。没铺满（渐变/碎色底）时仍逐组补准。
         {
           const wc0 = BGP.washColor;
-          const bgChain = chainChunks(BGP.bgAll.filter((g) => {
-            if (ringDone.has(g.gid)) return false;
-            if (!bgFloodOk) return true;
-            return Math.max(Math.abs(g.mean[0] - wc0[0]), Math.abs(g.mean[1] - wc0[1]),
-              Math.abs(g.mean[2] - wc0[2])) > 10;
-          }), handX, handY, 24);
+          const bgChain = chainChunks(BGP.bgAll.filter((g) =>
+            !ringDone.has(g.gid) && groupUncov[g.gid] > 0), handX, handY, 24);
           let bgDone = 0;
           for (const g of bgChain) {
             paintFull(g, 1);
@@ -6207,6 +6298,10 @@
             if (g.area < 8) continue;              // 极小碎点留给收笔遍
             fg[g.gid] = 1;
           }
+          // 只用"实色填充块"做对象骨架。细线是连通的网络，若也参与并查集，
+          // 窗框会把窗玻璃、花盆、书和桌面全部串成一个巨型对象，回放就会
+          // 整幅东补一笔西补一笔。颜色相近且相邻的填充块先归属同一对象；
+          // 轮廓线随后只挂到真正相邻的填充对象上，不再作为跨对象桥梁。
           const par = new Int32Array(G_).fill(-1);
           const find = (i) => {
             let r0 = i;
@@ -6220,33 +6315,140 @@
             if (par[a] > par[b]) { const t = a; a = b; b = t; }
             par[a] += par[b]; par[b] = a;
           };
+          const closeFill = (a, b) => {
+            const A = groups[a], B = groups[b];
+            if (!A || !B || A.lineLike || B.lineLike) return false;
+            return Math.max(Math.abs(A.mean[0] - B.mean[0]),
+              Math.abs(A.mean[1] - B.mean[1]),
+              Math.abs(A.mean[2] - B.mean[2])) <= 38;
+          };
           for (let y = 0; y < H; y++) {
             const row = y * W;
             for (let x = 0; x < W; x++) {
               const p = row + x, a = groupOf[p];
-              if (a < 0 || !fg[a]) continue;
-              if (x + 1 < W) { const b = groupOf[p + 1]; if (b >= 0 && b !== a && fg[b]) uni(a, b); }
-              if (y + 1 < H) { const b = groupOf[p + W]; if (b >= 0 && b !== a && fg[b]) uni(a, b); }
+              if (a < 0 || !fg[a] || groups[a].lineLike) continue;
+              if (x + 1 < W) {
+                const b = groupOf[p + 1];
+                if (b >= 0 && b !== a && fg[b] && closeFill(a, b)) uni(a, b);
+              }
+              if (y + 1 < H) {
+                const b = groupOf[p + W];
+                if (b >= 0 && b !== a && fg[b] && closeFill(a, b)) uni(a, b);
+              }
             }
           }
           const cmap = new Map();
+          const addToObj = (o, g) => {
+            o.gids.push(g.gid); o.gs.push(g); o.area += g.area;
+            if (g.x0 < o.x0) o.x0 = g.x0; if (g.y0 < o.y0) o.y0 = g.y0;
+            if (g.x1 > o.x1) o.x1 = g.x1; if (g.y1 > o.y1) o.y1 = g.y1;
+          };
           for (let gid = 0; gid < G_; gid++) {
-            if (!fg[gid]) continue;
+            if (!fg[gid] || groups[gid].lineLike) continue;
             const rt = find(gid);
             let o = cmap.get(rt);
             if (!o) { o = { gids: [], gs: [], area: 0, x0: W, y0: H, x1: -1, y1: -1 }; cmap.set(rt, o); }
-            const g = groups[gid];
-            o.gids.push(gid); o.gs.push(g); o.area += g.area;
-            if (g.x0 < o.x0) o.x0 = g.x0; if (g.y0 < o.y0) o.y0 = g.y0;
-            if (g.x1 > o.x1) o.x1 = g.x1; if (g.y1 > o.y1) o.y1 = g.y1;
+            addToObj(o, groups[gid]);
+          }
+          // 每条线统计它与哪些填充对象直接相邻；取邻接像素最多的那个作为归属。
+          // 没有直接邻接时按 bbox 距离找最近对象，避免孤立轮廓落到片尾。
+          const roots = [...cmap.keys()];
+          const rootObj = new Map(roots.map((r) => [r, cmap.get(r)]));
+          const objDist = (o, g) => {
+            const dx = Math.max(0, Math.max(o.x0 - g.x1, g.x0 - o.x1));
+            const dy = Math.max(0, Math.max(o.y0 - g.y1, g.y0 - o.y1));
+            return Math.hypot(dx, dy);
+          };
+          const looseLines = [];
+          for (let gid = 0; gid < G_; gid++) {
+            if (!fg[gid] || !groups[gid].lineLike) continue;
+            const g = groups[gid], votes = new Map();
+            for (let y = g.y0; y <= g.y1; y++) {
+              const row = y * W;
+              for (let x = g.x0; x <= g.x1; x++) {
+                const p = row + x;
+                if (groupOf[p] !== gid) continue;
+                const hit = (q) => {
+                  const ng = groupOf[q];
+                  if (ng < 0 || ng === gid || !fg[ng] || groups[ng].lineLike) return;
+                  const rt = find(ng);
+                  if (rootObj.has(rt)) votes.set(rt, (votes.get(rt) || 0) + 1);
+                };
+                if (x > 0) hit(p - 1);
+                if (x + 1 < W) hit(p + 1);
+                if (y > 0) hit(p - W);
+                if (y + 1 < H) hit(p + W);
+              }
+            }
+            let bestRoot = -1, bestVote = 0;
+            for (const [rt, v] of votes) if (v > bestVote) { bestVote = v; bestRoot = rt; }
+            if (bestRoot < 0 && roots.length) {
+              let bd = Infinity;
+              for (const rt of roots) {
+                const d = objDist(rootObj.get(rt), g);
+                if (d < bd) { bd = d; bestRoot = rt; }
+              }
+              if (bd > Math.max(24, Math.min(W, H) * 0.035)) bestRoot = -1;
+            }
+            if (bestRoot >= 0) addToObj(rootObj.get(bestRoot), g);
+            else looseLines.push(g);
+          }
+          // 没有填充对象的纯线稿仍按线-线邻接合成对象，保持可绘制。
+          if (looseLines.length) {
+            const lp = new Int32Array(G_).fill(-1);
+            const lf = (i) => { let r0 = i; while (lp[r0] >= 0) r0 = lp[r0]; return r0; };
+            const lu = (a, b) => { a = lf(a); b = lf(b); if (a === b) return; if (lp[a] > lp[b]) { const t = a; a = b; b = t; } lp[a] += lp[b]; lp[b] = a; };
+            const lset = new Uint8Array(G_);
+            for (const g of looseLines) lset[g.gid] = 1;
+            for (const g of looseLines) {
+              const gid = g.gid;
+              for (let y = g.y0; y <= g.y1; y++) {
+                const row = y * W;
+                for (let x = g.x0; x <= g.x1; x++) {
+                  const p = row + x;
+                  if (groupOf[p] !== gid) continue;
+                  if (x + 1 < W) { const b = groupOf[p + 1]; if (b >= 0 && lset[b]) lu(gid, b); }
+                  if (y + 1 < H) { const b = groupOf[p + W]; if (b >= 0 && lset[b]) lu(gid, b); }
+                }
+              }
+            }
+            const lmap = new Map();
+            for (const g of looseLines) {
+              const rt = lf(g.gid);
+              let o = lmap.get(rt);
+              if (!o) { o = { gids: [], gs: [], area: 0, x0: W, y0: H, x1: -1, y1: -1 }; lmap.set(rt, o); }
+              addToObj(o, g);
+            }
+            for (const o of lmap.values()) cmap.set(100000 + roots.length + cmap.size, o);
           }
           const out = [...cmap.values()];
           for (const o of out) {
             o.cx = (o.x0 + o.x1) * 0.5; o.cy = (o.y0 + o.y1) * 0.5;
             o.gs.sort((a, b) => b.area - a.area);
           }
-          // 阅读顺序：先上后下，同一排从左到右（人看海报先读最上面的标题）
-          out.sort((a, b) => (Math.round(a.cy / (H * 0.06)) - Math.round(b.cy / (H * 0.06))) ||
+          // 大块、高填充率的色板是构图背板（例如海报里占大半幅的蓝色版面），
+          // 即使不是主色家族，也必须先铺，再在其上画飞机/圆/文字。否则会先画出
+          // 一个悬空主体、几十秒后才补背景，过程不像人。其余对象按阅读顺序。
+          const objectTier = (o) => {
+            const bw = o.x1 - o.x0 + 1, bh = o.y1 - o.y0 + 1;
+            const fill = o.area / Math.max(1, bw * bh);
+            let sw = 0, ss = 0;
+            for (const g of o.gs) {
+              if (g.lineLike) continue;
+              sw += g.area; ss += g.sal * g.area;
+            }
+            const objSal = sw ? ss / sw : 1;
+            o.backdrop = (o.area >= N * 0.12 && bw * bh >= N * 0.10 &&
+              fill >= 0.50 && objSal <= 0.40) ? 1 : 0;
+            if (o.backdrop) return 0;
+            // 大面积、成片的前景层（山体、水面、主体底座）先铺；鸟/云纹/反光
+            // 这类小对象后画，避免中途出现"细节先出现、大片还没铺"的白洞。
+            if (o.area >= N * 0.03 && bw * bh >= N * 0.02 && fill >= 0.22) return 1;
+            if (o.area >= N * 0.002) return 2;
+            return 3;
+          };
+          out.sort((a, b) => (objectTier(a) - objectTier(b)) ||
+            (Math.round(a.cy / (H * 0.06)) - Math.round(b.cy / (H * 0.06))) ||
             (a.cx - b.cx));
           if (opts.debug) {
             console.log('[obj] n=' + out.length + ' top=' + out.slice(0, 10).map((o) =>
@@ -6903,10 +7105,20 @@
             const accRim = new Set(mk.rimGs.map((g) => g.gid));
             for (const g of rs.outer) if (!accRim.has(g.gid)) rolesO.other.push(g);
           }
-          const nOut = paintObjOutline(o, rolesO, mk, 2);
-          paintRimClusters(rolesO, 2);
+          // 背板先铺大色，再处理其中的飞机/圆形/文字与轮廓；普通对象才走
+          // "先描边、再填满"。否则大蓝底会先被其中的红圆/飞机轮廓抢跑。
+          let nOut = 0;
+          if (!o.backdrop) {
+            nOut = paintObjOutline(o, rolesO, mk, 2);
+            paintRimClusters(rolesO, 2);
+          }
           const f0 = strokes.length;
           paintObjFill(o, roles, mk, 2);
+          // 背板是手臂大幅铺色，不能按小细节的笔速占掉大半时间；
+          // 压短这一段时长，让后续主体在背景成形后尽快出现。
+          if (o.backdrop) {
+            for (let i = f0; i < strokes.length; i++) strokes[i].ms *= 0.28;
+          }
           // 换对象时手停一下"看"下一块（挂在第一笔的落笔时间上）
           if (strokes.length > f0) {
             const st0 = strokes[f0];
@@ -6916,6 +7128,13 @@
           cleanupObj(o, mk, 2);
           // 调试标记：这一段笔都属于同一个对象（真机排查"先描边再填满"用）
           for (let i = obStart; i < strokes.length; i++) strokes[i].ob = objDone;
+          // 跨大半画幅的纯线结构（外框、整页装饰线）是快速定界笔，
+          // 不能按小细节的速度吃掉大半时间；否则主体和文字会被拖到片尾。
+          const lineShare = o.gs.length ? o.gs.filter((g) => g.lineLike).length / o.gs.length : 0;
+          const spanLarge = (o.x1 - o.x0 + 1) > W * 0.55 || (o.y1 - o.y0 + 1) > H * 0.55;
+          if (lineShare >= 0.70 && spanLarge) {
+            for (let i = obStart; i < strokes.length; i++) strokes[i].ms *= 0.12;
+          }
           handX = o.cx; handY = o.cy;
           if (((objDone++) & 3) === 0) {
             prog(0.69 + 0.22 * objDone / Math.max(1, pobjs.length), '画主体：一个字/一个对象地完成…');
@@ -7043,7 +7262,11 @@
         if (opts.debug) console.log('[bgfirst] seedLab=' + seedLab + ' share=' +
           (seedShare * 100).toFixed(1) + '% fam=' + (famShareN * 100).toFixed(1) +
           '% gate=' + (painterFlow ? 'painter' : 'artist'));
-        if (famGate < 0.42 || seedShare < seedGate) return null;
+        // 画家过程版需要覆盖背景占比不高的插画/海报（天空、纸面、窗墙等），
+        // 不能只服务蓝底占大半的版式；42% 是艺术家路径的稳定阈值，
+        // painter 路径改用更宽容的 24% 下限，后续仍由 bgLike/贴边/面积闸门兜底。
+        const minFamShare = painterFlow ? 0.24 : 0.42;
+        if (famGate < minFamShare || seedShare < seedGate) return null;
         const bgSet = new Uint8Array(G_);
         const famGid = new Uint8Array(G_);
         const famBg = [], otherBg = [];
