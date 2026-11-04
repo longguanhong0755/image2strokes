@@ -1,17 +1,18 @@
 // 取任意笔号处的画布快照（用关键帧），复现"画到第 N 笔时画面长什么样"
-// 用法: node dev/frame_at.mjs dev/s3.raw 300,520,570 [colors] [tag]
+// 用法: node dev/frame_at.mjs dev/s3.raw 300,520,570 [colors] [tag] [layer|pyramid]
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
-await import(pathToFileURL(path.join(here, '..', 'js/pipeline.js')).href);
+await import(pathToFileURL(path.join(here, '..', 'js', 'pipeline.js')).href);
 const buf = fs.readFileSync(process.argv[2]);
 const W = buf.readInt32LE(0), H = buf.readInt32LE(4);
 const px = new Uint8ClampedArray(buf.buffer, buf.byteOffset + 8, W * H * 4);
 const idxs = process.argv[3].split(',').map(Number);
 const colors = process.argv[4] ? +process.argv[4] : 0;
 const tag = process.argv[5] || 'fr';
-const opts = { returnCanvas: true, returnKeys: true, keyFrames: 1200, debug: true };
+const algo = process.argv[6] || 'layer';
+const opts = { returnCanvas: true, returnKeys: true, keyFrames: 1200, debug: true, algo };
 if (colors) opts.colors = colors;
 const res = await globalThis.ISP_PIPELINE.run(px, W, H, opts, () => {});
 const keys = res.keys || [];

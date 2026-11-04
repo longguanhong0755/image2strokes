@@ -81,17 +81,30 @@
   .chips button:hover:not(:disabled){border-color:var(--line-2);color:var(--ink)}
   .chips button:disabled{opacity:.45;cursor:progress}
   .chips button:focus-visible,#phases span:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .chips button.on{border-color:var(--accent);color:var(--ink);background:var(--accent-soft,var(--panel))}
+  .thumbs{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+  .thumbs button{width:64px;height:64px;padding:0;border:1px solid var(--line);border-radius:10px;
+    overflow:hidden;background:var(--panel);cursor:pointer;position:relative;
+    transition:border-color .16s var(--ease),transform .16s var(--ease)}
+  .thumbs button img{width:100%;height:100%;object-fit:cover;display:block}
+  .thumbs button:hover:not(:disabled){border-color:var(--line-2);transform:translateY(-1px)}
+  .thumbs button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .thumbs button:disabled{opacity:.45;cursor:progress}
 
   /* ---------- 参数 ---------- */
   .row{display:flex;align-items:center;gap:10px;min-height:32px;margin-top:10px;font-size:13px;color:var(--ink-2)}
   .row:first-of-type{margin-top:0}
-  .row>span:first-child{width:64px;flex:none;color:var(--ink-3);font-size:12.5px}
+  .row>span:first-child{width:64px;flex:none;color:var(--ink-3);font-size:12.5px;white-space:nowrap}
   .row input[type=range]{flex:1;min-width:0;accent-color:var(--accent)}
   select{flex:1;min-width:0;height:32px;padding:0 8px;border:1px solid var(--line);
     border-radius:var(--r-sm);background:var(--panel);color:var(--ink);font:inherit;font-size:13px;
     transition:border-color .16s var(--ease)}
   select:hover{border-color:var(--line-2)}
-  #speedVal{width:44px;flex:none;text-align:right;font-family:var(--mono);font-size:12.5px;color:var(--ink-3)}
+  #speedVal,#fidVal{width:56px;flex:none;text-align:right;font-family:var(--mono);font-size:12.5px;color:var(--ink-3)}
+  .ticks{display:flex;margin:2px 66px 0 74px;font-size:10.5px;color:var(--ink-3)}
+  .ticks span{flex:1;text-align:center}
+  .ticks span:first-child{text-align:left}
+  .ticks span:last-child{text-align:right}
   .toggles{display:flex;gap:16px;flex-wrap:wrap;margin-top:12px}
   label.chk{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-2);cursor:pointer}
   input[type=checkbox]{accent-color:var(--accent)}
@@ -107,8 +120,18 @@
   #bar{transition:width .2s var(--ease)}
   #status{margin-top:8px;font-size:12.5px;color:var(--ink-3)}
   #canvasWrap{display:none}
-  #cv{display:block;margin:0 auto;background:#fff;border:1px solid var(--line);
+  .canvasBox{position:relative;width:fit-content;max-width:100%;margin:0 auto}
+  #cv{display:block;margin:0;background:#fff;border:1px solid var(--line);
     border-radius:var(--r-md);box-shadow:0 10px 28px rgba(40,35,30,.08)}
+  /* 细节放大镜：尾段的补笔只有几个像素，放大后用户才看得出“确实在画” */
+  #loupe{position:absolute;width:152px;height:152px;border:1px solid var(--line-2);
+    border-radius:var(--r-md);overflow:hidden;background:var(--panel);
+    box-shadow:0 8px 24px rgba(40,35,30,.18);display:none;pointer-events:none;z-index:2}
+  #loupe.on{display:block}
+  #loupe canvas{display:block;width:100%;height:100%;image-rendering:pixelated}
+  #loupe span{position:absolute;left:7px;top:6px;padding:1px 6px;border:1px solid var(--line);
+    border-radius:var(--r-pill);background:var(--panel);color:var(--ink-2);
+    font:10px/1.5 var(--mono);letter-spacing:.04em}
   .toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px}
   button.primary{height:36px;padding:0 16px;border:1px solid var(--accent);border-radius:var(--r-sm);
     background:var(--accent);color:#fff;font:inherit;font-size:13.5px;cursor:pointer;
@@ -143,8 +166,9 @@
   /* ---------- 页脚 ---------- */
   .foot{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:center;
     padding:4px 24px 28px;font-size:12px;color:var(--ink-3)}
-  .foot a{color:var(--ink-2);text-decoration:none;border-bottom:1px solid var(--line-2)}
-  .foot a:hover{color:var(--accent);border-bottom-color:var(--accent)}
+  .foot a,.foot button{color:var(--ink-2);text-decoration:none;border-bottom:1px solid var(--line-2)}
+  .foot a:hover,.foot button:hover{color:var(--accent);border-bottom-color:var(--accent)}
+  .foot button{font:inherit;background:none;border:0;border-bottom:1px solid var(--line-2);padding:0;cursor:pointer}
 
   /* ---------- 整页拖放提示层 ---------- */
   #dropMask{position:fixed;inset:0;z-index:50;display:none;place-items:center;pointer-events:none;
@@ -164,8 +188,10 @@
     .wrap{padding:12px}
     .card{padding:12px;border-radius:var(--r-md)}
     .row>span:first-child{width:52px}
+    .ticks{margin-left:62px}
     .toolbar{gap:8px}
     .seek{flex:1 1 100%;order:5}          /* 进度条单独一行，读数与按钮不挤 */
+    #loupe{width:112px;height:112px}
     .foot{padding:4px 12px 22px}
   }
   @media (max-height:620px){ #welcome{min-height:150px} .wrap{padding-top:14px} }
@@ -196,23 +222,41 @@
         <input id="file" type="file" accept="image/*" hidden>
       </div>
       <p id="note" class="note" role="status" aria-live="polite"></p>
-      <div class="chips" id="samples">
-        <button data-sample="samples/sample-1.jpg">插画</button>
-        <button data-sample="samples/sample-2.jpg">照片</button>
-        <button data-sample="samples/sample-3.jpg">海报</button>
+      <div class="chips" id="sampleCats" role="tablist" aria-label="示例图分类">
+        <button data-cat="ill" class="on" role="tab" aria-selected="true">插画</button>
+        <button data-cat="photo" role="tab" aria-selected="false">照片</button>
+        <button data-cat="poster" role="tab" aria-selected="false">海报</button>
+      </div>
+      <div class="thumbs" id="sampleThumbs" aria-label="示例图">
+        <button data-cat="ill" data-sample="samples/sample-1.jpg" title="插画：窗边的猫" aria-label="示例图：插画 1"><img src="samples/sample-1.jpg" alt="" loading="lazy"></button>
+        <button data-cat="ill" data-sample="samples/sample-4.jpg" title="插画：山湖日落" aria-label="示例图：插画 2"><img src="samples/sample-4.jpg" alt="" loading="lazy"></button>
+        <button data-cat="ill" data-sample="samples/sample-5.jpg" title="插画：窗台植物" aria-label="示例图：插画 3"><img src="samples/sample-5.jpg" alt="" loading="lazy"></button>
+        <button data-cat="photo" data-sample="samples/sample-2.jpg" title="照片：猫咪舔爪" aria-label="示例图：照片 1"><img src="samples/sample-2.jpg" alt="" loading="lazy"></button>
+        <button data-cat="photo" data-sample="samples/sample-6.jpg" title="照片：晨雾山谷" aria-label="示例图：照片 2"><img src="samples/sample-6.jpg" alt="" loading="lazy"></button>
+        <button data-cat="photo" data-sample="samples/sample-7.jpg" title="照片：窗边静物" aria-label="示例图：照片 3"><img src="samples/sample-7.jpg" alt="" loading="lazy"></button>
+        <button data-cat="poster" data-sample="samples/sample-3.jpg" title="海报：航空邮政（1927）" aria-label="示例图：海报 1"><img src="samples/sample-3.jpg" alt="" loading="lazy"></button>
+        <button data-cat="poster" data-sample="samples/sample-8.jpg" title="海报：FLY" aria-label="示例图：海报 2"><img src="samples/sample-8.jpg" alt="" loading="lazy"></button>
+        <button data-cat="poster" data-sample="samples/sample-9.jpg" title="海报：COFFEE" aria-label="示例图：海报 3"><img src="samples/sample-9.jpg" alt="" loading="lazy"></button>
       </div>
     </div>
 
     <div class="card params">
       <p class="lbl">参数</p>
       <div class="row">
-        <span>颜色数</span>
-        <select id="colors">
-          <option value="0" selected>自动（按图片判断）</option>
-          <option value="16">16 · 简笔</option>
-          <option value="24">24 · 标准</option>
-          <option value="32">32 · 细腻</option>
-          <option value="40">40 · 照片</option>
+        <span>还原程度</span>
+        <input id="fidelity" type="range" min="1" max="5" step="1" value="3" aria-label="还原程度" title="越往右笔触越细、笔数越多；画家模式的分区与成品精度不变">
+        <span id="fidVal">③ 标准</span>
+      </div>
+      <div class="ticks" aria-hidden="true">
+        <span>省笔</span><span>简洁</span><span>标准</span><span>精细</span><span>极致</span>
+      </div>
+      <div class="row">
+        <span>算法</span>
+        <select id="algo">
+          <option value="artist" selected>画家模式（准确复刻）</option>
+          <option value="painter">画家·过程版（新算法）</option>
+          <option value="layer">分层宽笔（像素重建对比）</option>
+          <option value="pyramid">逐级细化（像素重建对比）</option>
         </select>
       </div>
       <div class="row">
@@ -224,26 +268,19 @@
         </select>
       </div>
       <div class="row">
-        <span>时长</span>
-        <select id="detail">
-          <option value="0">快看 · 2 分钟</option>
-          <option value="1" selected>标准 · 4 分钟</option>
-          <option value="2">慢工 · 8 分钟</option>
-        </select>
-      </div>
-      <div class="row">
         <span>速度</span>
-        <input id="speed" type="range" min="0.25" max="4" step="0.25" value="2" aria-label="播放速度">
-        <span id="speedVal">2×</span>
+        <input id="speed" type="range" min="1" max="10" step="0.5" value="1" aria-label="播放速度">
+        <span id="speedVal">1×</span>
       </div>
       <div class="toggles">
         <label class="chk"><input id="tip" type="checkbox" checked> 笔尖</label>
         <label class="chk"><input id="guideChk" type="checkbox" checked> 运笔线</label>
+        <label class="chk"><input id="loupeChk" type="checkbox" checked> 细节放大</label>
         <label class="chk"><input id="cmp" type="checkbox"> 对比原图</label>
       </div>
       <div class="keys">
         <kbd>空格</kbd> 播放 · <kbd>←</kbd><kbd>→</kbd> 跳转 · <kbd>↑</kbd><kbd>↓</kbd> 调速
-        · <kbd>O</kbd> 对比 · <kbd>T</kbd> 笔尖 · <kbd>G</kbd> 运笔线 · <kbd>End</kbd> 成品
+        · <kbd>O</kbd> 对比 · <kbd>T</kbd> 笔尖 · <kbd>G</kbd> 运笔线 · <kbd>L</kbd> 细节放大 · <kbd>End</kbd> 成品
       </div>
     </div>
   </div>
@@ -254,7 +291,10 @@
       <div id="status">正在提炼…</div>
     </div>
     <div id="canvasWrap">
-      <canvas id="cv" width="1024" height="1024"></canvas>
+      <div class="canvasBox">
+        <canvas id="cv" width="1024" height="1024"></canvas>
+        <div id="loupe" aria-hidden="true"><canvas id="loupeCv"></canvas><span>细节 4×</span></div>
+      </div>
       <div class="toolbar">
         <button id="play" class="primary">暂停</button>
         <button id="toEnd" class="ghost" title="直接快进到画完">看成品</button>
@@ -263,11 +303,13 @@
       </div>
       <div class="barwrap" style="margin-top:8px"><div id="fill"></div></div>
       <div class="phases" id="phases" title="点一下跳到该阶段">
-        <span data-ph="0">① 起稿</span><span data-ph="1">② 铺色</span><span data-ph="2">③ 收形</span><span data-ph="3">④ 点睛</span>
+        <span data-ph="0">① 铺底色</span><span data-ph="1">② 铺色</span><span data-ph="2">③ 收形</span><span data-ph="3">④ 点睛</span><span data-ph="4" id="phFin">⑤ 落款</span>
       </div>
       <div class="toolbar" style="margin-top:10px">
         <button id="expVideo" class="ghost" disabled title="把整段过程录成 WebM">导出视频</button>
         <button id="expJson" class="ghost" disabled title="导出笔触脚本（含裁剪掩膜）">导出笔触</button>
+        <button id="expHtml" class="ghost" disabled title="导出单个网页文件，双击打开会自动一笔一笔画出来（可暂停/拖进度/调速）">导出网页</button>
+        <button id="expSvg" class="ghost" disabled title="导出矢量成品图：每笔一条路径，可无损放大；掩膜按需内嵌并压缩、白挂的自动省掉，比旧版小 4~6 倍">导出 SVG</button>
         <button id="expPng" class="ghost" disabled title="保存成品图">存成品图</button>
         <span id="expMsg"></span>
       </div>
@@ -288,10 +330,13 @@
 <p class="foot">
   <span>图片不出本机</span><span aria-hidden="true">·</span>
   <a href="https://loongsite.com/projects/image2strokes">算法说明与实测数据</a>
+  <span aria-hidden="true">·</span>
+  <button id="clearCache" type="button"
+          title="清掉本站缓存并强制刷新（效果等同 Ctrl+F5）：更新后仍看到旧版或页面异常时点它，当前画面会重置">清缓存刷新</button>
 </p>
 
 <div id="dropMask" aria-hidden="true"><span>松手即可上传</span></div>
 
-<script src="js/app.js?v=24"></script>
+  <script src="js/app.js?v=74"></script>
 </body>
 </html>

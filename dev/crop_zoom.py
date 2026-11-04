@@ -7,6 +7,8 @@ with open(src, 'rb') as f:
     data = f.read()
 a = Image.frombytes('RGBA', (W, H), data[:W*H*4]).convert('RGB')   # 源 raw 是 RGBA
 fb = open(fin, 'rb').read()
+if len(fb) == 8 + W * H * 3:                                       # artist_smoke 成品带 W/H 头
+    fb = fb[8:]
 b = Image.frombytes('RGB', (W, H), fb[:W*H*3])                     # 成品是 RGB
 box = (x, y, x + w, y + h)
 ca = a.crop(box).resize((w*sc, h*sc), Image.NEAREST)

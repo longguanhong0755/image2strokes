@@ -49,6 +49,28 @@ if (P && typeof P.run === 'function') {
   ok('run 有裁剪组', res && Array.isArray(res.clips));
   const s = res && res.strokes && res.strokes[0];
   ok('单笔结构', !!s && Array.isArray(s.rib) && Array.isArray(s.color));
+
+  // 第二种算法：整幅逐级细化（pyramid）也要能走稳定入口，并守住逐像素红线
+  const pres = await P.run(new Uint8ClampedArray(px), W, H,
+    { colors: 0, style: 'marker', fidelity: 3, algo: 'pyramid', returnCanvas: true }, () => {});
+  ok('pyramid 返回尺寸', pres && pres.W === W && pres.H === H, pres ? `${pres.W}x${pres.H}` : '空返回');
+  ok('pyramid 有笔触', pres && Array.isArray(pres.strokes) && pres.strokes.length > 0,
+    pres ? `${pres.strokes.length} 笔` : '');
+  const pq = pres && pres.stats && pres.stats.quality;
+  ok('pyramid 红线', !!pq && pq.max <= pq.tolerance && pq.uncovered === 0,
+    pq ? `max=${pq.max} T=${pq.tolerance} unc=${pq.uncovered}` : '没有 quality');
+
+  // 画家·过程版：稳定入口也要能跑通，并守住逐像素红线
+  const hres = await P.run(new Uint8ClampedArray(px), W, H,
+    { colors: 0, style: 'marker', fidelity: 3, algo: 'painter', returnCanvas: true }, () => {});
+  ok('painter 返回尺寸', hres && hres.W === W && hres.H === H, hres ? `${hres.W}x${hres.H}` : '空返回');
+  ok('painter 有笔触', hres && Array.isArray(hres.strokes) && hres.strokes.length > 0,
+    hres ? `${hres.strokes.length} 笔` : '');
+  ok('painter 归档', hres && hres.stats && hres.stats.algo === 'painter',
+    hres && hres.stats ? `algo=${hres.stats.algo} order=${hres.stats.exactOrder || '-'}` : '');
+  const hq = hres && hres.stats && hres.stats.quality;
+  ok('painter 红线', !!hq && hq.max <= hq.tolerance && hq.uncovered === 0,
+    hq ? `max=${hq.max} T=${hq.tolerance} unc=${hq.uncovered}` : '没有 quality');
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

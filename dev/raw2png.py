@@ -5,7 +5,10 @@ for i in range(1, len(sys.argv), 2):
     src, dst = sys.argv[i], sys.argv[i+1]
     d = open(src, 'rb').read()
     w, h = struct.unpack('<ii', d[:8])
-    if len(d) == 8 + w*h*3:
+    mode = 'RGB'
+    if len(d) == 8 + w*h*4:
+        mode, body = 'RGBA', d[8:]
+    elif len(d) == 8 + w*h*3:
         body = d[8:]
     else:
         cand = src.replace('.rgb', '.raw')
@@ -15,5 +18,8 @@ for i in range(1, len(sys.argv), 2):
             body = d
         else:
             raise SystemExit('need size: ' + src)
-    Image.frombytes('RGB', (w, h), body).save(dst)
+    im = Image.frombytes(mode, (w, h), body)
+    if mode == 'RGBA':
+        im = im.convert('RGB')
+    im.save(dst)
     print(dst, w, h)

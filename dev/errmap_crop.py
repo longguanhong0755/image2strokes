@@ -6,7 +6,10 @@ with open(src, 'rb') as f:
     W = struct.unpack('<i', f.read(4))[0]; H = struct.unpack('<i', f.read(4))[0]
     data = f.read()
 a = Image.frombytes('RGBA', (W, H), data[:W*H*4]).convert('RGB')
-b = Image.frombytes('RGB', (W, H), open(fin, 'rb').read()[:W*H*3])
+fb = open(fin, 'rb').read()
+if len(fb) == 8 + W * H * 3:
+    fb = fb[8:]
+b = Image.frombytes('RGB', (W, H), fb[:W*H*3])
 pa, pb = a.load(), b.load()
 err = Image.new('RGB', (W, H), (255, 255, 255))
 pe = err.load()
