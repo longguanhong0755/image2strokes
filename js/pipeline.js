@@ -5867,7 +5867,6 @@
         const seen = new Uint8Array(N);
         const bfs = new Int32Array(N);
         let endX = bx1, endY = by1, nStrokes = 0, nFix = 0;
-        let bgSmoothCol = null;
         for (let r = 0; r < rows; r++) {
           const sy = by0 + r * stripH, ey = Math.min(by1, sy + stripH - 1);
           // 每列的主导色组（字形覆盖的列沿用两侧的蓝，不重开一段）
@@ -5927,44 +5926,6 @@
             run.col = [Math.round(sr / sn), Math.round(sg / sn), Math.round(sb / sn)];
             keep.push(run);
           }
-          // 同一横排内如果各段颜色很接近，就统一成这条带的平滑色，避免底座
-          // 被切成一段段矩形色块；真正的横向渐变仍保留分段色。
-          if (keep.length) {
-            let tr = 0, tg = 0, tb = 0, tn = 0;
-            for (const run of keep) {
-              let n = 0;
-              for (let y = sy; y <= ey; y++) {
-                const row = y * W;
-                for (let x = run.x0; x <= run.x1; x++) {
-                  const p = row + x;
-                  if (!core[p]) continue;
-                  tr += R[p]; tg += G[p]; tb += B[p]; n++;
-                }
-              }
-              tn += n;
-            }
-            if (tn) {
-              const stripMean = [Math.round(tr / tn), Math.round(tg / tn), Math.round(tb / tn)];
-              const uniform = keep.every((run) => Math.max(
-                Math.abs(run.col[0] - stripMean[0]),
-                Math.abs(run.col[1] - stripMean[1]),
-                Math.abs(run.col[2] - stripMean[2])) <= 20);
-              if (uniform) {
-                if (bgSmoothCol) {
-                  const dd = Math.max(Math.abs(bgSmoothCol[0] - stripMean[0]),
-                    Math.abs(bgSmoothCol[1] - stripMean[1]),
-                    Math.abs(bgSmoothCol[2] - stripMean[2]));
-                  const a = dd <= 18 ? 0.55 : 0.85;
-                  bgSmoothCol = [
-                    Math.round(bgSmoothCol[0] + (stripMean[0] - bgSmoothCol[0]) * a),
-                    Math.round(bgSmoothCol[1] + (stripMean[1] - bgSmoothCol[1]) * a),
-                    Math.round(bgSmoothCol[2] + (stripMean[2] - bgSmoothCol[2]) * a),
-                  ];
-                } else bgSmoothCol = stripMean;
-                for (const run of keep) run.col = bgSmoothCol;
-              } else bgSmoothCol = stripMean;
-            }
-          }
           // 字/框的空档：左右两段的色线性过渡着刷过去（每 ~60px 一段）。
           // 直接用一侧的颜色会把字的轮廓留在蓝底上；过渡刷过去，字位就和蓝底融成一片。
           const segs = [];
@@ -6014,7 +5975,6 @@
             }
             const si = emitStroke(sp, halfs, seg.col, 0, {
               pen: 0, color: seg.col, zoneMaskRect: zoneRect, noCover: 1, minInk: 8,
-              dither: 2.2, ditherSeed: r * 7.1 + seg.x0 * 0.17 + runSeed * 0.37,
               ms: Math.round(12 + len * 0.35),
             });
             if (si >= 0) { nStrokes++; strokes[si].fl = 1; }
@@ -6169,8 +6129,9 @@
           let bn = 0;
           for (let p = 0; p < N; p++) {
             const gid = groupOf[p];
-            if (gid >= 0 && !segPaper[p] && !paintN[p] &&
-              (BGP.bgSet[gid] || groups[gid].area <= N * 0.006)) { bm[p] = 1; bn++; }
+            // 只给真正的背景组打底。把"所有小组"也包进来会让 s5 在刚起笔时
+            // 先冒出一条红色/黄色的前景横带，看起来像误刷而不是铺底。
+            if (gid >= 0 && !segPaper[p] && !paintN[p] && BGP.bgSet[gid]) { bm[p] = 1; bn++; }
           }
           if (bn > N * 0.03) {
             const tile = Math.max(28, Math.min(56, Math.round(Math.min(W, H) * 0.045)));
@@ -6274,7 +6235,11 @@
             !ringDone.has(g.gid) && groupUncov[g.gid] > 0), handX, handY, 24);
           let bgDone = 0;
           for (const g of bgChain) {
+            const bs = strokes.length;
             paintFull(g, 1);
+            // 背景补准是铺完底色后的顺手收拾，不是主体刻画。压缩这些小笔
+            // 的相对时长，让大背板和主体不要等到回放过半才出现。
+            for (let i = bs; i < strokes.length; i++) strokes[i].ms *= 0.52;
             handX = g.cx; handY = g.cy;
             if (((bgDone++) & 15) === 0) {
               prog(0.70 + 0.16 * bgDone / Math.max(1, bgChain.length), '细化背景：整片刷准…');
@@ -7299,6 +7264,16 @@
           if (famG || bgLike || frame || edgeArt) {
             bgSet[g.gid] = 1; bgN += g.area;
             (famG ? famBg : otherBg).push(g);
+          }
+        }
+        // 次主色的大背板（例如两段式海报上半幅的深蓝版面）常常不属于
+        // 主色家族，但它在视觉上就是背景。按"大面积 + 高填充 + 低显著度"
+        // 补进背景阶段，先铺色再画上面的主体和文字。
+        for (const g of groups) {
+          if (bgSet[g.gid] || g.lineLike) continue;
+          const fill = g.area / Math.max(1, g.bw * g.bh);
+          if (g.area >= N * 0.12 && fill >= 0.50 && g.sal <= 0.40) {
+            bgSet[g.gid] = 1; bgN += g.area; otherBg.push(g);
           }
         }
         if (opts.debug) console.log('[bgfirst] bgN=' + (bgN / N * 100).toFixed(1) + '%');
