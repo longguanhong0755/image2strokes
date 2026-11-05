@@ -45,12 +45,15 @@ function paintPhaseChips() {
 function setAlgoPhases(a) {
   // painter（画家·过程版）默认沿用 artist 的标签，防止照片回退路径上标签错配；
   // 平涂走新五遍流程时，结果回来后按 exactOrder==='painter' 再覆盖成专用标签。
-  algo = a === 'pyramid' ? 'pyramid' : (a === 'artist' || a === 'painter' ? a : 'layer');
-  PHASES = algo === 'artist' || algo === 'painter'
-    ? ['起形', '铺大色', '塑形', '点睛', '收笔']
-    : algo === 'pyramid'
-      ? ['起稿', '铺色', '细化', '收形', '落款']
-      : ['铺底色', '铺色', '收形', '点睛', '落款'];
+  algo = a === 'pyramid' ? 'pyramid' :
+    (a === 'artist' || a === 'painter' || a === 'compiler' ? a : 'layer');
+  PHASES = algo === 'compiler'
+    ? ['铺满父色块', '子区域覆盖', '逐层完成', '细节压回', '收笔']
+    : algo === 'artist' || algo === 'painter'
+      ? ['起形', '铺大色', '塑形', '点睛', '收笔']
+      : algo === 'pyramid'
+        ? ['起稿', '铺色', '细化', '收形', '落款']
+        : ['铺底色', '铺色', '收形', '点睛', '落款'];
   paintPhaseChips();
 }
 
@@ -150,7 +153,7 @@ function startExtract(imgCanvas) {
     seed: runSeed,
   };
   if (!worker) {
-    worker = new Worker('js/worker.js?v=62');
+    worker = new Worker('js/worker.js?v=63');
     worker.onmessage = onWorker;
     worker.onerror = (e) => { setExtracting(false); note('出错：' + e.message, 'err'); };
   }
@@ -172,6 +175,11 @@ function onWorker(e) {
   // 平涂精确复刻改成"背景先行"后，四步的含义也跟着变（不是起形/铺大色了）
   if (STATS.exactOrder === 'bgfirst') {
     PHASES = ['起稿铺满', '细化背景', '细化主体', '前景细节', '收笔'];
+    paintPhaseChips();
+  }
+  // 闭合区域画家：父色块绕边并填满，再逐层把子区域画回来。
+  if (STATS.exactOrder === 'closed' || STATS.exactOrder === 'compiler') {
+    PHASES = ['铺满父色块', '子区域覆盖', '逐层完成', '细节压回', '收笔'];
     paintPhaseChips();
   }
   // 画家·过程版：人画五遍（起稿铺底 → 逐对象完成 → 点睛 → 收笔）
@@ -244,7 +252,7 @@ function buildTimeline() {
   // 时长不再让用户选：画家模式按"有限笔数、看得清起承转合"给 30~90 秒；
   // 像素重建的旧模式仍按笔数给 150 秒起、8 分钟封顶。
   // 极简图（两横一竖这类，就几笔）不顶 30 秒下限：每笔 ~1.1 秒，几秒画完。
-  targetMs = (algo === 'artist' || algo === 'painter')
+  targetMs = (algo === 'artist' || algo === 'painter' || algo === 'compiler')
     ? (n < 20
         ? clamp(Math.round(n * 1100), 3200, 30000)
         : clamp(Math.round(n * 24), 30000, 90000))
@@ -265,14 +273,17 @@ function buildTimeline() {
       // 手就在旁边就顺势接着画（不占时间）；隔得远才抬笔"飞"过去
       travels[i] = d < 40 ? 0 : Math.min(200, 30 + (d - 40) * 0.35);
     }
+    // 大幅铺底/定界是连续挥臂，不是逐笔抬腕找位置；否则几百条扫带光移动
+    // 就会吃掉前四分之一时间轴，背景和主体迟迟立不起来。
+    if (st.travelK !== undefined) travels[i] *= Math.max(0, st.travelK);
     const ph = st.ph === undefined ? 1 : (st.ph | 0);
     // 换阶段前停一下，像在回看；真人停顿长短不一，固定值像节拍器（仅画家模式随机化）
     const hb = hash01(i * 0.917 + RUN_SEED * 0.013, 4.4);
     if (prevPh >= 0 && ph !== prevPh) {
-      beats[i] = (algo === 'artist' || algo === 'painter') ? (ph === 3 ? 480 + hb * 420 : 300 + hb * 320) : (ph === 3 ? 700 : 420);
+      beats[i] = (algo === 'artist' || algo === 'painter' || algo === 'compiler') ? (ph === 3 ? 480 + hb * 420 : 300 + hb * 320) : (ph === 3 ? 700 : 420);
     }
     if (st.fin && !prevFin) {
-      beats[i] = Math.max(beats[i], (algo === 'artist' || algo === 'painter') ? 700 + hb * 500 : 900);   // 落款前停一下，让最后一拨看得清
+      beats[i] = Math.max(beats[i], (algo === 'artist' || algo === 'painter' || algo === 'compiler') ? 700 + hb * 500 : 900);   // 落款前停一下，让最后一拨看得清
     }
     prevFin = !!st.fin;
     prevPh = ph;
@@ -291,7 +302,7 @@ function buildTimeline() {
   let nonPaint = 0;
   for (let i = 0; i < n; i++) nonPaint += travels[i] + beats[i];
   const budget = Math.max(n, targetMs - nonPaint);
-  if (algo === 'artist' || algo === 'painter') {
+  if (algo === 'artist' || algo === 'painter' || algo === 'compiler') {
     // 画家模式按阶段排时间：起形/铺大色按落笔量分剩下的时间，
     // 塑形/点睛/收笔按"每笔至少多久"单独预留。塑形只有两三百笔，
     // 若仍按总落笔量分，会在最后几秒里一闪而过，看不出来在收形。
@@ -316,7 +327,7 @@ function buildTimeline() {
       // 留 1% 让它像最后盖个章，不能漏掉，否则 phaseMs[4] 无定义会毁掉整条时间轴。
       // 背景先行时背景本身就占了大半画面，时间也要跟着让给背景；
       // 主体一次画完一处，文字/细节收尾，不能还按旧的"起形 16%"分。
-      const share = STATS.exactOrder === 'painter'
+      const share = (STATS.exactOrder === 'painter' || STATS.exactOrder === 'closed' || STATS.exactOrder === 'compiler')
         ? (() => {
             // 所有画家路径统一按"每段笔数 + 落笔量"分时间：铺满/勾框/补背景这类
             // 笔数少但动作大的阶段不会被主体段挤成零点几秒，也不再按图类型写死配比。
@@ -324,6 +335,18 @@ function buildTimeline() {
             for (let p = 0; p < 5; p++) raw[p] = Math.max(pN[p] / 100, pC[p] / 6000);
             const sum = raw.reduce((a, b) => a + b, 0) || 1;
             const s = raw.map((v) => v / sum);
+            // 起稿/背景细化只是把大关系立住，不能因为碎笔多就吃掉前半段。
+            // 给前两个阶段一个总时长上限，剩余时间按原有比例还给主体与收笔；
+            // 这样 30% 左右已经进入“逐对象完成”，而不是还在空版面上磨。
+            const leadCap = 0.22;
+            const leadRaw = s[0] + s[1];
+            if (leadRaw > leadCap) {
+              const k = leadCap / leadRaw;
+              const freed = leadRaw - leadCap;
+              s[0] *= k; s[1] *= k;
+              const tail = s[2] + s[3] + s[4];
+              if (tail > 0) for (let p = 2; p < 5; p++) s[p] += freed * s[p] / tail;
+            }
             const floor = [0.10, 0.05, 0.05, 0.02, 0.01];
             let tot = 0;
             for (let p = 0; p < 5; p++) {
@@ -2195,7 +2218,7 @@ function bindUI() {
   // 算法选择：URL ?algo= 优先，其次记住上次选择。
   // 不记住的话每次刷新都会弹回默认的 artist（准确复刻），看起来就像"改动没生效/还是旧版"。
   const ALGO_KEY = 'isp.algo';
-  const ALGO_OK = { artist: 1, painter: 1, layer: 1, pyramid: 1 };
+  const ALGO_OK = { artist: 1, painter: 1, compiler: 1, layer: 1, pyramid: 1 };
   const saveAlgo = (v) => { try { localStorage.setItem(ALGO_KEY, v); } catch (e) {} };
   const pickAlgo = () => {
     const sel = $('algo');

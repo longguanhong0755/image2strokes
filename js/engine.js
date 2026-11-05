@@ -19,7 +19,7 @@ if (typeof importScripts !== 'function') {
 // 外部项目把本文件放在别的目录时，先设 self.ISP_ENGINE_BASE = '<到 js/ 的目录 URL，带结尾 />'。
 // 不设则默认跟 Worker 同目录（image2strokes 自己的 worker 就是这种情况）。
 const ENGINE_BASE = new URL(self.ISP_ENGINE_BASE || './', self.location.href).href;
-importScripts(new URL('pipeline.js?v=60', ENGINE_BASE).href);
+importScripts(new URL('pipeline.js?v=61', ENGINE_BASE).href);
 
 if (!self.ISP_PIPELINE || typeof self.ISP_PIPELINE.run !== 'function') {
   throw new Error('image2strokes engine.js: pipeline.js 没有导出 run()');
@@ -28,5 +28,5 @@ if (!self.ISP_PIPELINE || typeof self.ISP_PIPELINE.run !== 'function') {
 // 稳定契约版本。pipeline 内部怎么改都不动它；只有 run() 的入参/返回结构破坏性变化才 +1。
 self.ISP_PIPELINE.api = 1;
 // 给人看的引擎版本（跟 pipeline 的 ?v= 保持一致即可）
-self.ISP_PIPELINE.version = '60';
+self.ISP_PIPELINE.version = '61';
 self.ISP_PIPELINE.entry = 'image2strokes/js/engine.js';

@@ -9,7 +9,7 @@ Worker（classic worker）里：
 
 ```js
 self.ISP_ENGINE_BASE = 'https://longguanhong0755.github.io/image2strokes/js/';
-importScripts(self.ISP_ENGINE_BASE + 'engine.js?v=41');
+importScripts(self.ISP_ENGINE_BASE + 'engine.js?v=42');
 const res = await self.ISP_PIPELINE.run(px, W, H, opts, onProgress);
 ```
 
@@ -22,7 +22,7 @@ const res = await self.ISP_PIPELINE.run(px, W, H, opts, onProgress);
 ```js
 self.ISP_PIPELINE = {
   api: 1,
-  version: '60',
+  version: '61',
   run(px, W, H, opts, onProgress) -> Promise<{
     W, H,
     strokes: [{ rib, tp, color, vis?, fin?, ... }],
@@ -37,7 +37,12 @@ self.ISP_PIPELINE = {
 - `px`：`Uint8ClampedArray`，RGBA，长度 `W*H*4`
 - `opts`：见 `pipeline.js` 顶部 `CFG`；常用 `algo/fidelity/style/coverMode`。
   `algo` 是算法选择：`'layer'`（不传时的默认，分层宽笔）/ `'pyramid'`（整幅逐级细化）/
-  `'artist'`（画家模式，网页端默认，见下）/ `'painter'`（画家·过程版，见下）。
+  `'artist'`（画家模式，网页端默认，见下）/ `'painter'`（画家·过程版，见下）/ `'compiler'`（无训练区域编译器：闭合父块填满、子块覆盖、线条最后）。
+  **`algo:'compiler'`（无训练绘画编译器）** 不做模型训练：现场从量化色区和细线候选中建立包含层级，
+  父区域先沿闭合轮廓走一圈再把轮廓内部整块填满（不查询内部异色标签），随后子区域按层级覆盖，
+  细线候选最后压在最上层；收尾只修错误轮廓/分层/漏线，不做全图均值补丁。低色数白底线稿
+  会按调色板标签把量化切碎的线重新合并，沿全局骨架中心线落笔；`?algo=compiler` 与网页下拉框
+  均走同一入口，原有 `artist/painter/layer/pyramid` 全部保留为回退。
   `layer` 仍是 API 默认值，老消费方不传 `algo`
   行为不变；显式传 `'artist'` 才走画家模式。
   `fidelity` 是 1~5 的还原程度（3 = 标准，默认）；老字段 `detail` 仍兼容（0→1、1→3、2→5）。
@@ -106,26 +111,32 @@ self.ISP_PIPELINE = {
   `'wash'` 逐组补准；是否铺满按面积/贴边/颜色均匀度自动判定，不按图的类型特判）。
 - `onProgress(p, msg)`：`p` 是 0~1
 - `stats.fidelity` 是本次实际使用的还原档位（1~5）；`stats.detail` 保留给老消费方。
-- 三种算法都返回 `stats.quality`。`layer/pyramid`：`{tolerance, bucketT, max, mean, gt8, gt24, gt48,
+- 四种算法都返回 `stats.quality`。`layer/pyramid`：`{tolerance, bucketT, max, mean, gt8, gt24, gt48,
   uncovered, regions, colorRegions, inkRegions}`，`tolerance` 是本档颜色容差（逐像素最大
   通道差上界），`max/mean/gt*` 是规划画布对原图的实测读数；`uncovered` 必须为 0。
   `artist` 额外有 `{artist:true, paperOK, subjectCoverage, edgeScore, thumbMean, thumbBad}`，
   `tolerance` 固定 255（不承诺逐像素上界；色区取精确均值，边界/纹理处仍有差异），
   `mean/max/gt*` 是实测诊断读数；`uncovered` 正常为 0（精确通路会先补齐漏画像素）。
+  `artist/compiler` 的 `mean/gt8/gt24/gt48` 统一按整张画布统计，和导出 PNG/RGB 后逐像素复核一致；
+  另给 `paintMean/paintGt8/paintGt24/paintGt48` 保留“非纸面”旧口径。`uncovered` 只统计
+  “未落笔且画布误差仍大于 8”的非纸面像素，因此线稿内部白区不会再被误报为漏画；
+  `effectiveCoverage` 是“真实触笔或画布已与原图一致”的像素占比。
   `dbg.artist.exact`（`debug:true` 时）结构为：`{seed, mode:'flat'|'photo', regions, groups, strokes,
   mergePasses, uncovered, uncoveredGroups, residualPx, residualComps, residualStrokes,
-  zeroRemoved, rimPx, paintable, ms, order, bgFill, ring, bgGroups, washPx, elements}`。`dbg.artist.exact.mode` 是实际走的策略
+  zeroRemoved, rimPx, paintable, ms, order, bgFill, ring, bgGroups, washPx, elements,
+  compilerMode}`。`dbg.artist.exact.mode` 是实际走的策略
   （`flat` = 封闭色块，`photo` = 细色区）；`order='bgfirst'` 表示平涂走了“背景先行 + 元素块”排法
   （`bgGroups` = 背景块数、`elements` = 前景元素块数），`order='painter'` 是画家·过程版的
   人画流程（铺满整页 → 勾外框/补背景 → 逐个对象先描外轮廓、整块填满、再补内部细节 →
   点睛·收笔；`bgFill` = 背景铺法：`once` 主色背景条带一次刷满（面积≥15%、铺满画幅≥60%
   或被细框包住、颜色均匀度≤12，全部按像素测量，不按颜色特判）/ `wash` 逐组补准；
   `ring` = 是否画了闭合外框；`objects` = 像素连通的 foreground 对象数），
-  `order='phase'` 是照片/回退排法；
+  `order='compiler'` 是闭合区域编译器；`compilerMode='centerline'|'color-centerline'` 表示
+  低色数线稿按骨架中心线完成，而不是逐色块补缝。`order='phase'` 是照片/回退排法；
   painter 照片仍为 `order='phase'`，但作画组织是"近似底色 → 色区笔（窄笔、56px 一段取局部均值）
   → 四层误差驱动的分层细化（粗/中/细/极细，每笔落笔前算误差增益，不能减少误差就不发笔）"；
   `order='phase'` 下 `bgFill/ring` 为 undefined。分层细化只作用于 painter 照片，artist 照片笔流不变。
-  `stats.exactOrder` 与 `dbg.artist.exact.order` 同值。`stats.photo` 仍是原始 `isFlat` 判定，
+  `stats.exactOrder` 与 `dbg.artist.exact.order` 同值；`stats.compilerMode` 与 `dbg.artist.exact.compilerMode` 同值。`stats.photo` 仍是原始 `isFlat` 判定，
   两者可能不同（扫描海报可能 `isFlat=false` 但 `flatScore>0.52`，按平涂处理）。
 - `layer/pyramid` 下每个像素只属于一个颜色区，`rib` 是这条扫笔掩膜的整数外框矩形，
   `tp` 是回放用的笔尖轨迹（只影响观感）；消费方按“多边形 ∩ 1 位掩膜”绘制，
