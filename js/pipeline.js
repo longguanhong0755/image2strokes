@@ -8780,52 +8780,80 @@
           }
           return made;
         };
-        // 大版面底色不要用几条超宽笔硬扫：宽的恒定色笔会把缓慢明暗变化压成
-        // “云状接缝”。这里按横向窄条现场取原色，每个短段一笔，仍裁在父区域
-        // 的完整闭合 mask 内；内部文字/图形只是被铺底盖过去，随后由子区域覆盖。
+        // 大版面底色按“连续横向扫带”铺设，而不是随机重叠的大色块。每条
+        // 扫带从底板内部的纯色芯取稳健均值，相邻扫带共享很宽的取样窗，
+        // 因而能保留扫描带来的缓慢二维色场，又不会产生随机云斑、文字周围
+        // 接缝，或把黑框/字边混色带进蓝底。笔仍严格裁在父区域的闭合 mask 内。
         const fillPageLike = (r, ph) => {
           const ground = r.groundMask || r.fillMask;
           const zmr = { m: ground, x0: r.x0, y0: r.y0, w: r.bw, h: r.bh };
-          // 底色不是规则网格。沿画幅横向铺半重叠的长笔，每一行错开起笔，
-          // 颜色只从父区域的连续色场取样。这样既保留纸张/扫描的缓慢明暗，
-          // 又不会让相邻格子的取色差在画面上留下笔直的方阵接缝。
-          const band = Math.max(16, Math.min(38, Math.round(Math.min(W, H) * 0.034)));
-          const stepY = Math.max(9, Math.round(band * 0.60));
-          const hw = band * 0.80;
-          const yLo = r.y0 - hw * 0.35, yHi = r.y1 + hw * 0.35;
+          const band = Math.max(14, Math.min(44, Math.round(Math.min(W, H) * 0.032)));
+          const hw = band * 0.64;
+          const stepY = Math.max(8, Math.round(band * 0.80));
+          const yLo = r.y0 - hw * 0.30, yHi = r.y1 + hw * 0.30;
           const rows = Math.max(1, Math.ceil((yHi - yLo) / stepY));
+          const base = r.model.mean;
+          // 取色只看原始可见底板像素；groundMask 是闭合领地，包含文字/图形
+          // 的洞，若拿它取均值会把字心、描边混进底色。
+          const inSample = (x, y) => {
+            const xx = x - r.x0, yy = y - r.y0;
+            return xx >= 0 && yy >= 0 && xx < r.bw && yy < r.bh &&
+              !!r.mask[yy * r.bw + xx];
+          };
+          const coreAt = (x, y) => {
+            if (!inSample(x, y)) return false;
+            for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+              if ((dx || dy) && !inSample(x + dx, y + dy)) return false;
+            }
+            return true;
+          };
+          const samplePatch = (xc, cy, radiusX) => {
+            const iy0 = Math.max(r.y0, Math.floor(cy - band * 0.55));
+            const iy1 = Math.min(r.y1, Math.ceil(cy + band * 0.55));
+            const ix0 = Math.max(r.x0, Math.floor(xc - radiusX));
+            const ix1 = Math.min(r.x1, Math.ceil(xc + radiusX));
+            let sr = 0, sg = 0, sb = 0, sn = 0;
+            for (let yy = iy0; yy <= iy1; yy += 2) {
+              const row = yy * W;
+              for (let xx = ix0; xx <= ix1; xx += 2) {
+                if (!coreAt(xx, yy)) continue;
+                const p = row + xx;
+                sr += R[p]; sg += G[p]; sb += B[p]; sn++;
+              }
+            }
+            return sn ? [sr / sn, sg / sn, sb / sn] : r.model.colorAt(xc, cy);
+          };
           let made = 0;
+          const pageW = r.x1 - r.x0 + 1;
+          const segN = Math.max(1, Math.min(6, Math.ceil(pageW / 175 * scaleB)));
+          const segW = pageW / segN;
+          const radX = Math.max(segW * 0.62, band * 3.5);
           for (let ry = 0; ry < rows; ry++) {
             const yc = Math.min(yHi, yLo + ry * stepY) +
-              (srnd(r.id * 3.7 + ry * 2.3 + runSeed * 0.017, 4.7) - 0.5) * stepY * 0.35;
-            let x = r.x0 - hw * (0.35 + srnd(r.id + ry * 1.7, 3.2) * 0.45);
-            while (x < r.x1) {
-              const run = band * (3.0 + srnd(r.id * 5.1 + ry * 0.91 + x * 0.013, 2.8) * 3.2);
-              const xa = x, xb = Math.min(r.x1 + hw * 0.7, x + run);
-              if (xb - xa < 4) break;
-              const n = Math.max(3, Math.min(9, Math.round((xb - xa) / 34) + 2));
+              (srnd(r.id * 3.7 + ry * 2.3 + runSeed * 0.017, 4.7) - 0.5) * stepY * 0.18;
+            for (let sgx = 0; sgx < segN; sgx++) {
+              const xa = r.x0 + segW * sgx, xb = r.x0 + segW * (sgx + 1);
+              const cm = samplePatch(Math.round((xa + xb) * 0.5), yc, radX);
+              // 保留低频二维色场，但压低扫描颗粒；相邻扫带共享宽取样窗，
+              // 因而只有缓慢色差，不会重新变成随机云斑。
+              const c = [
+                Math.round(base[0] + (cm[0] - base[0]) * 0.90),
+                Math.round(base[1] + (cm[1] - base[1]) * 0.90),
+                Math.round(base[2] + (cm[2] - base[2]) * 0.90),
+              ];
+              const n = 5;
               const sp = new Float64Array(n * 2), halfs = new Float64Array(n);
-              const bow = (srnd(r.id * 1.9 + ry * 1.31 + xa * 0.007, 6.1) - 0.5) * band * 0.20;
+              const bow = (srnd(r.id * 1.9 + ry * 1.31 + sgx * 0.73, 6.1) - 0.5) * band * 0.08;
               for (let i = 0; i < n; i++) {
                 const f = i / (n - 1);
-                sp[i * 2] = xa + (xb - xa) * f;
+                sp[i * 2] = xa - hw * 0.18 + (xb - xa + hw * 0.36) * f;
                 sp[i * 2 + 1] = yc + bow * Math.sin(Math.PI * f) +
-                  (srnd(r.id * 1.3 + ry * 0.7 + xa * 0.01 + i, 3.1) - 0.5) * 0.38;
-                halfs[i] = hw * (0.90 + 0.10 * Math.sin(Math.PI * f)) *
-                  (0.96 + 0.08 * srnd(r.id * 2.9 + ry * 0.31 + xa * 0.01 + i, 6.1));
+                  (srnd(r.id * 1.3 + ry * 0.7 + sgx * 0.41 + i, 3.1) - 0.5) * 0.22;
+                halfs[i] = hw * (0.98 + 0.04 * Math.sin(Math.PI * f));
               }
-              const cm = r.model.colorAt(Math.round((xa + xb) * 0.5), Math.round(yc));
-              const base = r.model.mean;
-              const c = [
-                Math.round(base[0] + (cm[0] - base[0]) * 0.55),
-                Math.round(base[1] + (cm[1] - base[1]) * 0.55),
-                Math.round(base[2] + (cm[2] - base[2]) * 0.55),
-              ];
               const si = emitMasked(sp, halfs, c, ph, zmr, 'compiler:pagefill',
-                Math.round(15 + (xb - xa) * 0.38), 0);
+                Math.round(20 + (xb - xa) * 0.22), 0);
               if (si >= 0) made++;
-              // 横向也重叠 35%，颜色边界藏在相邻笔身下面，不会对齐成竖条。
-              x += run * 0.72;
             }
           }
           return made;
@@ -8893,9 +8921,12 @@
             paintLineRegion(r, ph, true);
           } else {
             if (r.outer) contourStroke(r, r.outer, ph, 'compiler:edge');
-            const pageLike = r.mode === 'solid' && (
-              (r.depth === 0 && r.fillArea >= N * 0.4 && r.bw >= W * 0.75 && r.bh >= H * 0.75) ||
-              (r.modelFrom !== undefined && r.fillArea >= N * 0.005));
+            // 只有真正的页面根底板使用连续扫带。被归一进底色的较大色块
+            // 仍保留真实填充（否则 s8/s9 的内层底板会被外层纸色吞掉），但
+            // 必须按自己的闭合 mask 普通填充，不能各自再铺一遍整页扫带。
+            const pageLike = r.mode === 'solid' &&
+              r.depth === 0 && r.fillArea >= N * 0.4 &&
+              r.bw >= W * 0.75 && r.bh >= H * 0.75;
             if (pageLike) fillPageLike(r, ph);
             else fillRegion(r, r.fillMask, ph, 'compiler:fill', null, r.mode === 'ring' ? 1 : 0);
           }
@@ -8936,8 +8967,16 @@
           return Math.max(Math.abs(canvas[k] - R[p]), Math.abs(canvas[k + 1] - G[p]),
             Math.abs(canvas[k + 2] - B[p]));
         };
+        // 页面底板已经由一色多笔完整铺满；扫描纹理与原图均值之间的
+        // 自然色差不是“漏画”。若这里再按误差补局部均值，会把本来
+        // 连贯的蓝底重新切成深色云斑。局部修正只服务前景对象；页面
+        // 层级错误已在排序阶段先外后内解决。
+        const pageGroundOwner = (p) => {
+          const oid = plan.owner[p];
+          return oid >= 0 && !!(plan.regions[oid] && plan.regions[oid].pageGround);
+        };
         for (let p0 = 0; p0 < N && repaired < maxRepairStrokes; p0++) {
-          if (segPaper[p0] || seen[p0] || errAt(p0) <= 28) continue;
+          if (segPaper[p0] || seen[p0] || pageGroundOwner(p0) || errAt(p0) <= 28) continue;
           const sr0 = R[p0], sg0 = G[p0], sb0 = B[p0];
           let head = 0, tail = 0;
           q[tail++] = p0; seen[p0] = 1;
@@ -8949,7 +8988,7 @@
             if (x < x0) x0 = x; if (x > x1) x1 = x;
             if (y < y0) y0 = y; if (y > y1) y1 = y;
             const visit = (z) => {
-              if (z < 0 || z >= N || seen[z] || segPaper[z] || errAt(z) <= 28) return;
+              if (z < 0 || z >= N || seen[z] || segPaper[z] || pageGroundOwner(z) || errAt(z) <= 28) return;
               if (Math.max(Math.abs(R[z] - sr0), Math.abs(G[z] - sg0),
                 Math.abs(B[z] - sb0)) > 26) return;
               seen[z] = 1; q[tail++] = z;
@@ -9998,7 +10037,10 @@
         const markDepth = (r, d) => { r.depth = d; for (const ch of r.children) markDepth(ch, d + 1); };
         const roots = regions.filter((r) => !r.parent);
         for (const r of roots) markDepth(r, 0);
-        const rootScore = (r) => (r.x0 <= 1 || r.x1 >= W - 2 || r.y0 <= 1 || r.y1 >= H - 2 ? N * 2 : 0) + r.area;
+        // 页面级实心色块按“闭合领地”而不是可见像素排序：外层纸色常常
+        // 把内层深色底板当洞填满，必须先落外层，再让内层底板覆盖回来。
+        const rootScore = (r) => (r.x0 <= 1 || r.x1 >= W - 2 || r.y0 <= 1 || r.y1 >= H - 2 ? N * 2 : 0) +
+          (r.mode === 'solid' && r.fillArea >= N * 0.12 ? r.fillArea : r.area);
         roots.sort((a, b) => rootScore(b) - rootScore(a));
         const order = [];
         const walked = new Set();
@@ -10096,25 +10138,33 @@
         // 页面级锚点把同一色场的碎块合并成一张连续“底板”。它们本来就会被
         // 父色场一起覆盖，保留为独立小区域只会让后续补缝各取局部均值，重新
         // 形成色块云。只对真正的页面大底色启用，不吞普通对象内部的小色块。
-        const pageGround = (r) => r.mode === 'solid' && r.outer &&
+        const pageGround = (r) => r.mode === 'solid' && r.outer && !normalized.has(r) &&
           r.fillArea >= N * 0.12 && (r.bw >= W * 0.55 || r.bh >= H * 0.55);
         for (const r of regions) {
           if (!pageGround(r)) continue;
-          const gm = r.fillMask.slice();
-          for (const ch of regions) {
-            if (ch === r || ch.modelFrom !== r.id || !ch.mask) continue;
-            for (let yy = 0; yy < ch.bh; yy++) {
-              const dy = ch.y0 + yy - r.y0;
-              if (dy < 0 || dy >= r.bh) continue;
-              for (let xx = 0; xx < ch.bw; xx++) {
-                if (!ch.mask[yy * ch.bw + xx]) continue;
-                const dx = ch.x0 + xx - r.x0;
-                if (dx < 0 || dx >= r.bw) continue;
-                gm[dy * r.bw + dx] = 1;
+          // 真正的页面根底板按闭合包围领地铺满：字、图形、扫描裂缝都在
+          // 父层里先被盖过去，再由子区域逐层覆盖。其余 compact 底板仍只
+          // 合并同族碎块，避免把圆盘/内层面板扩成方形。
+          const rootBlock = r.mode === 'solid' && r.depth === 0 &&
+            r.fillArea >= N * 0.4 && r.bw >= W * 0.75 && r.bh >= H * 0.75;
+          const gm = rootBlock ? new Uint8Array(r.bw * r.bh).fill(1) : r.fillMask.slice();
+          if (!rootBlock) {
+            for (const ch of regions) {
+              if (ch === r || ch.modelFrom !== r.id || !ch.mask) continue;
+              for (let yy = 0; yy < ch.bh; yy++) {
+                const dy = ch.y0 + yy - r.y0;
+                if (dy < 0 || dy >= r.bh) continue;
+                for (let xx = 0; xx < ch.bw; xx++) {
+                  if (!ch.mask[yy * ch.bw + xx]) continue;
+                  const dx = ch.x0 + xx - r.x0;
+                  if (dx < 0 || dx >= r.bw) continue;
+                  gm[dy * r.bw + dx] = 1;
+                }
               }
             }
           }
           r.groundMask = gm;
+          r.pageGround = true;
           // 大底板用色场表达明暗，不雕塑扫描颗粒。对 32×32 色场做两次
           // 3×3 低通，只作用于页面级锚点；文字/图形自己的色块不经过这里。
           const m = r.model;
@@ -10158,7 +10208,26 @@
         // 归一到父色场的碎块只保留真实子对象继续覆盖；碎块自身不再重复
         // 勾边/铺色。父区域已经用完整闭合色场盖过它们，再画一遍只会产生
         // 低对比接缝，并把笔数翻倍。
-        const fills = order.filter((r) => r.mode !== 'line' && !normalized.has(r));
+        // 归一碎块默认由锚点的 groundMask 一次铺过。若它只是页面根底板的
+        // 一个实心碎片，再填一遍会把锚点色场在边框/抗锯齿附近的暗值刷回
+        // 底板，形成云斑。环形描边、非页面根锚点下的实心区域（例如 s9 的
+        // 奶油色圆形）仍有独立几何，必须保留。判断只依赖层级、面积和锚点，
+        // 不依赖文件名或固定颜色。
+        const pageRootAnchor = (r) => {
+          if (r.modelFrom === undefined) return false;
+          const a = regions[r.modelFrom];
+          return !!(a && a.mode === 'solid' && a.depth === 0 &&
+            a.fillArea >= N * 0.4 && a.bw >= W * 0.75 && a.bh >= H * 0.75);
+        };
+        const fills = order.filter((r) => {
+          if (r.mode === 'line') return false;
+          if (!normalized.has(r)) return true;
+          if (r.modelFrom === undefined || r.fillArea < N * 0.005) return false;
+          // 页面根底板下的大型实心碎片已经在 groundMask 中铺过；小实心块
+          // （s9 的杯口局部等）仍保留独立覆盖，不能一刀切丢掉。
+          return !(r.mode === 'solid' && pageRootAnchor(r) &&
+            r.fillArea >= N * 0.006);
+        });
         const lines = order.filter((r) => r.mode === 'line' && !skipLine(r));
         // 给对象执行器一份“背景所有权”：只由顶层大色面和群组自身的 bg 标记
         // 构成，不按图片类型硬编码。前景字/线即使紧贴背景，其多数像素仍由
@@ -10172,16 +10241,38 @@
         }
         const objectBgGids = new Uint8Array(G_);
         const bgHits = new Int32Array(G_);
+        const groundHits = new Int32Array(G_);
+        const groundDist = new Float64Array(G_);
+        const groundDistN = new Int32Array(G_);
         for (let p = 0; p < N; p++) {
           const gid = groupOf[p];
-          if (gid >= 0 && bgRegionIds.has(owner[p])) bgHits[gid]++;
+          if (gid < 0) continue;
+          const oid = owner[p];
+          if (oid < 0) continue;
+          const r = regions[oid];
+          if (!r) continue;
+          if (bgRegionIds.has(oid)) bgHits[gid]++;
+          // 页面底板的 groundMask 已排除字心、前景对象和描边；但仍会留下
+          // 扫描纹理和抗锯齿碎组。用碎组均值到“锚点总均值”的距离判断：
+          // 同族蓝色纹理归背景，红字边、奶油字心等偏离主色的组仍交给组级
+          // 收口。不能使用局部色场取值，因为边框附近色场本身会被暗边污染。
+          if (!r.pageGround) continue;
+          const g = groups[gid];
+          if (!g) continue;
+          groundHits[gid]++;
+          groundDist[gid] += Math.max(Math.abs(r.model.mean[0] - g.mean[0]),
+            Math.abs(r.model.mean[1] - g.mean[1]), Math.abs(r.model.mean[2] - g.mean[2]));
+          groundDistN[gid]++;
         }
         // “父层所有权”只能用来识别真正成片的背景，不能把背景上的小字/
         // 抗锯齿碎片一起吞掉。小色组即使整块落在顶层背景区域内，也仍是
         // 前景细节，必须留给组级收口；否则 s8/s9 这类小字会被静默跳过。
         const bgMinArea = Math.max(400, Math.round(N * 0.00045));
         for (const g of groups) {
-          if (g.bg || (bgHits[g.gid] >= g.area * 0.5 && g.area >= bgMinArea)) {
+          const groundLike = groundHits[g.gid] >= Math.max(2, g.area * 0.5) &&
+            groundDistN[g.gid] > 0 && groundDist[g.gid] / groundDistN[g.gid] <= 64;
+          if (g.bg || groundLike ||
+            (bgHits[g.gid] >= g.area * 0.5 && g.area >= bgMinArea)) {
             objectBgGids[g.gid] = 1;
           }
         }
