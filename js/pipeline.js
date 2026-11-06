@@ -9141,6 +9141,27 @@
           const rows = Math.max(2, Math.ceil((pageBot - pageTop) / Math.max(8, brushW * 0.48)) + 1);
           const nPt = Math.max(3, Math.min(18, Math.round((r.x1 - r.x0 + 1) / 62)));
           let made = 0;
+          // 第一笔必须是完整页面的底色 wash，而不是只铺出上半页。后续横向
+          // 扫带只负责恢复纹理变化；背景基色在进入任何前景对象前已经闭合。
+          // 这样 2%/10% 等早期帧不会出现半张白页，正常作画也不会在蓝底中
+          // 留下尚未铺色的空洞。
+          const fullHalfH = (r.y1 - r.y0 + 1) * 0.56;
+          const washSp = new Float64Array([
+            r.x0 - hw * 0.35, (r.y0 + r.y1) * 0.5,
+            (r.x0 + r.x1) * 0.5, (r.y0 + r.y1) * 0.5,
+            r.x1 + hw * 0.35, (r.y0 + r.y1) * 0.5,
+          ]);
+          const washHalfs = new Float64Array([fullHalfH, fullHalfH, fullHalfH]);
+          const wash = emitStroke(washSp, washHalfs, color, ph, {
+            zoneMaskRect: zmr, color, noCover: 0, noZone: 1, ignoreCap: 1, minInk: 1,
+            ms: Math.round(180 + (r.x1 - r.x0) * 0.18),
+          });
+          if (wash >= 0) {
+            strokes[wash].stage = 'compiler:page-wash';
+            strokes[wash].travelK = 0.02;
+            strokes[wash].fl = 1;
+            made++;
+          }
           for (let row = 0; row < rows; row++) {
             const f = rows === 1 ? 0.5 : row / (rows - 1);
             const yy = pageTop + (pageBot - pageTop) * f;
