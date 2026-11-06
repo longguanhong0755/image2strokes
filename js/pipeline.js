@@ -8885,6 +8885,9 @@
           // 一个父层颜色，不按 x 切片。这样既不会出现竖向色带，也不会
           // 把内部文字/图案的颜色混进父层。
           const varyY = !!(r.model && r.model.kind !== 'const' && r.pageGround);
+          // 每条横向扫带只取一个父层颜色：用父块中心 x 读取沿 y 的色场，
+          // 不按 x 切片，避免把父层内部的前景颜色混进来或产生竖向色带。
+          const sampleX = r.x0 + Math.floor(r.bw * 0.5);
           for (let y = 0; y < r.bh; y += step) {
             const row = y * r.bw;
             let x = 0;
@@ -9152,7 +9155,9 @@
             }
             const si = emitStroke(sp, halfs, color, ph, {
               zoneMaskRect: zmr, color, noCover: 0, noZone: 1, ignoreCap: 1, minInk: 1,
-              ms: Math.round(250 + (r.x1 - r.x0) * 0.45),
+              // 底板是观众最先看到的大动作，不能在一瞬间刷完整页。每条
+              // 横向扫带按画幅宽度计时，配合奇偶行反向形成可见的蛇形铺底。
+              ms: Math.round(1600 + (r.x1 - r.x0) * 2.6),
             });
             if (si >= 0) {
               strokes[si].stage = 'compiler:page-undercoat';
@@ -9175,8 +9180,24 @@
             return !!(rr && rr.pageGround);
           };
           const bgGroups = [];
+          const groundMean = (r.model && r.model.mean) || r.color || [0, 0, 0];
+          // 底板纹理只能取“与底板同色族”的碎组。所有权图会把部分字的
+          // 抗锯齿边缘留在页面根上；若只按 own>=50% 收集，整页文字会先在
+          // 15% 处以鬼影形式出现。这里用相对底板代表色的色差自适应过滤，
+          // 不依赖具体颜色或样例：渐变/暗角仍保留，红字、奶油字心等异色
+          // 边缘留给对象事务。
+          const groundGate = 56;
+          // 只把真正成片的页面色场当成底板纹理。文字/描边旁的抗锯齿
+          // 碎片面积小、所有权混杂，重画后会在主体尚未落笔时泄露整页
+          // 鬼影；它们由后续对象事务和细节笔负责，不能提前参与底板。
+          const bgMinArea = Math.max(300, Math.round(N * 0.00045));
+          const bgOwnMin = 0.85;
+          let filteredGroups = 0;
           for (const g of groups) {
             if (!g || g.area <= 0) continue;
+            const gap = Math.max(Math.abs(g.mean[0] - groundMean[0]),
+              Math.abs(g.mean[1] - groundMean[1]), Math.abs(g.mean[2] - groundMean[2]));
+            if (g.area < bgMinArea || gap > groundGate) { filteredGroups++; continue; }
             let own = 0;
             const x0 = Math.max(0, g.x0), y0 = Math.max(0, g.y0);
             const x1 = Math.min(W - 1, g.x1), y1 = Math.min(H - 1, g.y1);
@@ -9187,7 +9208,7 @@
                 if (groupOf[p] === g.gid && isPageGroundPixel(p)) own++;
               }
             }
-            if (own >= Math.max(1, g.area * 0.5)) bgGroups.push(g);
+            if (own >= Math.max(1, g.area * bgOwnMin)) bgGroups.push(g);
           }
           bgGroups.sort((a, b) => b.area - a.area);
           // 逐组重铺必须裁在原色组 mask 内，颜色取该组真实局部色；顺序只在
@@ -9199,11 +9220,15 @@
               strokes[i].stage = 'compiler:page-bg';
               strokes[i].travelK = 0.055;
               strokes[i].fl = 1;
+              // 背景纹理是快速铺色，不是观众需要逐笔审视的主体事务。
+              // 压低这些小笔的时间权重，避免 10k 个底色抖动吞掉近半条时间线；
+              // 最终像素和笔数完全不变，只让主体对象更早进入画面。
+              strokes[i].ms *= 0.10;
             }
             if (strokes.length > start) made += strokes.length - start;
           }
           if (opts.debug) console.log('[compiler-page] bgGroups=' + bgGroups.length +
-            ' strokes=' + made + ' root=' + r.id);
+            ' filtered=' + filteredGroups + ' strokes=' + made + ' root=' + r.id);
           return made;
         };
 
@@ -9242,8 +9267,58 @@
           return made || fillRegion(r, r.fillMask, ph, 'compiler:line-fallback', null, 1);
         };
 
-        let done = 0;
-        for (const r of plan.fills) {
+        // 执行器按“对象事务”落笔，而不是先全图描边、再全图填色。
+        // 中间过程因此与真人作画一致：一个对象完成外框、父填色、子区域、
+        // 边缘和细节后才抬笔去下一个对象。规划仍使用完整的包含树和闭合 mask，
+        // 这里只改变执行顺序，不针对文件名、坐标或画面内容做特判。
+        const fillSet = new Set(plan.fills);
+        // 页面底色常被扫描纹理/文字切断成多个 normalized 碎片。它们不是
+        // 前景对象，而是页面色场的延伸；若把整块碎片当成一个事务，右侧
+        // 半页会连同标题一起抢在其它对象前画完。这里只做结构性判定，
+        // 不依赖颜色/坐标：凡是归一化并指回页面根锚点的区域都算背景边界。
+        // 只有真正覆盖画幅、位于包含树根部的区域才是“页面底板”。局部大色块
+        // 也可能带 pageGround 标记并用来合并扫描碎片，但归一到这种局部锚点的
+        // 子块仍是对象自己的分层（例如圆盘的奶油色内层），不能被背景过滤跳过。
+        const pageAnchor = (a) => !!(a && a.mode === 'solid' && a.depth === 0 &&
+          a.fillArea >= N * 0.4 && a.bw >= W * 0.75 && a.bh >= H * 0.75);
+        const backgroundLike = (r) => !!(r && ((r.pageGround && pageAnchor(r)) ||
+          (plan.normalized.has(r) && r.modelFrom !== undefined &&
+            pageAnchor(plan.regions[r.modelFrom]))));
+        const inRegionHull = (r, x, y) => {
+          const xx = Math.round(x) - r.x0, yy = Math.round(y) - r.y0;
+          if (xx < 0 || yy < 0 || xx >= r.bw || yy >= r.bh) return false;
+          return !!(r.hullMask && r.hullMask[yy * r.bw + xx]);
+        };
+        const txRootOf = (r) => {
+          let t = r;
+          while (t.parent && !backgroundLike(t.parent) && !t.parent.frameLike) t = t.parent;
+          return t;
+        };
+        const readKey = (r) => {
+          // 阅读顺序用对象左上角，而不是包围盒中心。高字母的 bbox 中心
+          // 会下沉到下一行，导致标题被拆到段落之后才画。
+          const rowH = Math.max(24, Math.min(84, H * 0.065));
+          return Math.floor(r.y0 / rowH) * 100000 + r.x0;
+        };
+        const childKey = (r) => r.cy * W + r.cx;
+        const tagTx = (from, txId) => {
+          for (let i = from; i < strokes.length; i++) strokes[i].tx = txId;
+        };
+        const addObjectPause = (from, seed) => {
+          if (strokes.length <= from) return;
+          // 换对象时短暂“看”下一块。pause 落在一号笔上，不改变总笔数。
+          strokes[from].ms += 150 + srnd(seed, 11.7) * 260;
+          strokes[from].travelK = Math.max(0.16, strokes[from].travelK || 0.06);
+        };
+
+        // 底板先铺满，再落画框；两者都是独立大型事务。
+        const pageFills = plan.fills.filter((r) => r.pageGround)
+          .sort((a, b) => b.fillArea - a.fillArea);
+        const frameFills = plan.fills.filter((r) => !r.pageGround &&
+          (r.frameLike || r.canvasFrame)).sort((a, b) => b.fillArea - a.fillArea);
+        const backgroundSet = new Set(pageFills.concat(frameFills));
+        for (const r of plan.fills) if (backgroundLike(r)) backgroundSet.add(r);
+        const paintRegionBase = (r) => {
           const ph = regionPhase(r);
           // 环形是真正的细线结构（字边、红描边、画框）：沿中心线绘制并逐段
           // 取局部原色，比用宽扫带覆盖整条环更贴近原图的明暗和抗锯齿。
@@ -9260,60 +9335,51 @@
             } else {
               paintLineRegion(r, ph);
             }
-            done++;
-            if ((done & 7) === 0) {
-              prog(0.69 + 0.20 * done / Math.max(1, plan.fills.length),
-                '编译器：外描边父形铺满，子区域再覆盖…');
-              await yieldUI();
-            }
-            continue;
+            return;
           }
           // 外描边内部的暗边/抗锯齿细带属于同一圈描边，不是独立色块。
           // 对这类细子带沿中心线取局部色，避免把字边阴影刷成一条均值硬带。
           if (r.parent && r.parent.mode === 'ring' && r.thickness <= 6.5) {
             paintLineRegion(r, ph, true);
+            return;
+          }
+          // 页面根底板的 outer 会沿扫描纹理/文字造成的内部断裂绕行，
+          // 在底板尚未铺完时提前描出 “MAIL” 等轮廓。根底板边界由
+          // groundMask 扫带裁切和独立画框事务负责，这里只描真正的对象。
+          if (r.outer && !r.pageGround) contourStroke(r, r.outer, ph, 'compiler:edge');
+          // 只有真正的页面根底板使用连续扫带。被归一进底色的较大色块
+          // 仍保留真实填充（否则 s8/s9 的内层底板会被外层纸色吞掉），但
+          // 必须按自己的闭合 mask 普通填充，不能各自再铺一遍整页扫带。
+          const pageLike = r.mode === 'solid' &&
+            r.depth === 0 && r.fillArea >= N * 0.4 &&
+            r.bw >= W * 0.75 && r.bh >= H * 0.75;
+          if (pageLike) {
+            // 只有“纹理/渐变底板”或“底板自身占主导且模型仍有残差”的
+            // 扫描件才逐原组重铺。纯常数底板与填色线稿继续走 compiler 的
+            // 低笔数色场，避免 s8 和矢量填色样例反向劣化。
+            const rootOwn = r.fillArea / Math.max(1, r.bw * r.bh);
+            const texturedRoot = !!(r.model && (r.model.kind !== 'const' ||
+              (rootOwn >= 0.45 && (r.model.err || 0) >= 1)));
+            if (texturedRoot) paintPageParity(r, ph);
+            else fillPageLike(r, ph);
           } else {
-            if (r.outer) contourStroke(r, r.outer, ph, 'compiler:edge');
-            // 只有真正的页面根底板使用连续扫带。被归一进底色的较大色块
-            // 仍保留真实填充（否则 s8/s9 的内层底板会被外层纸色吞掉），但
-            // 必须按自己的闭合 mask 普通填充，不能各自再铺一遍整页扫带。
-            const pageLike = r.mode === 'solid' &&
-              r.depth === 0 && r.fillArea >= N * 0.4 &&
-              r.bw >= W * 0.75 && r.bh >= H * 0.75;
-            if (pageLike) {
-              // 只有“纹理/渐变底板”或“底板自身占主导且模型仍有残差”的
-              // 扫描件才逐原组重铺。纯常数底板与填色线稿继续走 compiler 的
-              // 低笔数色场，避免 s8 和矢量填色样例反向劣化。
-              const rootOwn = r.fillArea / Math.max(1, r.bw * r.bh);
-              const texturedRoot = !!(r.model && (r.model.kind !== 'const' ||
-                (rootOwn >= 0.45 && (r.model.err || 0) >= 1)));
-              if (texturedRoot) paintPageParity(r, ph);
-              else fillPageLike(r, ph);
-            }
-            else {
-              // 有子区域的实心父块同样使用自身代表色整体填满；内部异色
-              // 暂时被覆盖，随后由包含树中的子区域逐层恢复。只有叶子
-              // 区域保留自己的局部分析色场。
-              const parentColor = r.children.length ? r.color : null;
-              if (parentColor) fillParentMask(r, r.fillMask, ph, parentColor, 'compiler:parent-fill');
-              else fillRegion(r, r.fillMask, ph, 'compiler:fill', null, r.mode === 'ring' ? 1 : 0);
-            }
+            // 有子区域的实心父块同样使用自身代表色整体填满；内部异色
+            // 暂时被覆盖，随后由包含树中的子区域逐层恢复。只有叶子
+            // 区域保留自己的局部分析色场。
+            const parentColor = r.children.length ? r.color : null;
+            if (parentColor) fillParentMask(r, r.fillMask, ph, parentColor, 'compiler:parent-fill');
+            else fillRegion(r, r.fillMask, ph, 'compiler:fill', null, r.mode === 'ring' ? 1 : 0);
           }
-          done++;
-          if ((done & 7) === 0) {
-            prog(0.69 + 0.20 * done / Math.max(1, plan.fills.length),
-              '编译器：父色块填满，子区域逐层覆盖…');
-            await yieldUI();
-          }
-        }
+        };
+
         // 大实心父块的原始 mask 通常只包含“确定属于本块”的像素。圆边、
         // 斜边和字角还有一圈 1px 的源图抗锯齿带，若只填父色就会留下
         // 孤立暗缺口。这里沿“膨胀 1px 与内缩 1px 之间”的几何边带追踪
         // 一条连续曲线，逐段读取源图局部色；不会扩大主体，也不会把整块
         // 边缘用一个均值刷平。
-        for (const r of plan.fills) {
+        const paintRegionRim = (r) => {
           if (r.mode !== 'solid' || r.pageGround || !r.children.length ||
-            r.fillArea < N * 0.01 || !r.fillMask) continue;
+            r.fillArea < N * 0.01 || !r.fillMask) return;
           const rim = dilate(r.fillMask, r.bw, r.bh, 1);
           const core = erode(r.fillMask, r.bw, r.bh, 1);
           const band = new Uint8Array(rim.length);
@@ -9332,24 +9398,222 @@
                 zmr, 'compiler:edgeband', Math.round(18 + part.len * 0.35), 1);
             }
           }
-        }
-        // 描边父形被字心覆盖后，若还有被磨薄的边，最后沿真实边掩膜补一遍。
-        // 这一遍仍裁在原描边像素内，不会侵占字心或背景，只是恢复父层边缘。
-        for (const r of plan.fills) {
+        };
+        const paintRingSeam = (r) => {
           if (r.mode === 'ring' && r.children.length) {
             paintLineRegion(r, Math.min(3, Math.max(2, r.depth + 1)), true);
           }
+        };
+
+        // 一页底板 / 画框事务。
+        let bgDone = 0;
+        for (const arr of [pageFills, frameFills]) {
+          for (const r of arr) {
+            const from = strokes.length;
+            paintRegionBase(r);
+            tagTx(from, 'bg:' + r.id);
+            bgDone++;
+            if ((bgDone & 3) === 0) {
+              prog(0.69 + 0.20 * bgDone / Math.max(1, pageFills.length + frameFills.length),
+                '编译器：铺满底板与画框…');
+              await yieldUI();
+            }
+          }
         }
-        // 线条最后画：简笔画按中心线走，彩色线稿与填色线稿也在最上层收边。
-        done = 0;
+
+        // 每个顶层前景对象形成不可拆事务；内部父子仍严格由外到内。
+        const txMap = new Map();
+        for (const r of plan.fills) {
+          if (backgroundSet.has(r)) continue;
+          const root = txRootOf(r);
+          if (!root) continue;
+          let tx = txMap.get(root);
+          if (!tx) {
+            tx = { root, items: [], lines: [] };
+            txMap.set(root, tx);
+          }
+          tx.items.push(r);
+        }
+        const transactions = [...txMap.values()].sort((a, b) => readKey(a.root) - readKey(b.root));
+        const txOfRegion = new Map();
+        for (const tx of transactions) for (const r of tx.items) txOfRegion.set(r, tx);
+
+        // 组级细节也要跟着对象走：先按组内像素的归属对象投票，把每个
+        // 前景细节组绑定到对应事务；未被任何对象认领的组仍留到最后，
+        // 只用于页面纹理和真正无归属的碎片。这样标题/段落的小字与
+        // 抗锯齿边会在该对象抬笔前完成，而不是等全图主体画完后再跳着补。
+        const noBgGroups = new Uint8Array(G_);
+        const txDetailGroups = new Map();
+        const detailRemainingGids = new Set(groups.map((g) => g.gid));
+        for (const g of groups) {
+          const votes = new Map();
+          let otherN = 0;
+          for (let y = g.y0; y <= g.y1; y++) {
+            const row = y * W;
+            for (let x = g.x0; x <= g.x1; x++) {
+              const p = row + x;
+              if (groupOf[p] !== g.gid) continue;
+              const oid = plan.owner[p];
+              const rr = oid >= 0 ? plan.regions[oid] : null;
+              if (!rr || backgroundLike(rr) || rr.frameLike || rr.canvasFrame) { otherN++; continue; }
+              const tx = txOfRegion.get(rr);
+              if (!tx) { otherN++; continue; }
+              votes.set(tx, (votes.get(tx) || 0) + 1);
+            }
+          }
+          let bestTx = null, bestN = 0;
+          for (const [tx, n] of votes) if (n > bestN) { bestTx = tx; bestN = n; }
+          // 被背景所有权粘住的字形抗锯齿、点、短线通常会把多数像素记到
+          // 页面/大底板上，单纯按 owner 投票会漏掉。若组本身是细节尺寸，
+          // 再按几何归属找最近的对象事务；这也让同一文字对象的字缘和主体
+          // 在同一个事务内完成，而不是全部堆到片尾。
+          if ((!bestTx || bestN <= otherN) && g.area <= Math.max(900, N * 0.0015)) {
+            const gcx = (g.x0 + g.x1) * 0.5, gcy = (g.y0 + g.y1) * 0.5;
+            let bestDist = Infinity, bestArea = Infinity;
+            for (const tx of transactions) {
+              for (const f of tx.items) {
+                if (f.mode === 'line' || f.pageGround) continue;
+                let dist;
+                if (inRegionHull(f, gcx, gcy)) dist = 0;
+                else {
+                  const dx = Math.max(0, f.x0 - g.x1, g.x0 - f.x1);
+                  const dy = Math.max(0, f.y0 - g.y1, g.y0 - f.y1);
+                  dist = Math.hypot(dx, dy);
+                }
+                const a = f.hullArea || f.fillArea || f.area;
+                if (dist < bestDist - 0.25 || (Math.abs(dist - bestDist) <= 0.25 && a < bestArea)) {
+                  bestDist = dist; bestArea = a; bestTx = tx;
+                }
+              }
+            }
+            const maxAssoc = Math.max(18, Math.min(48, Math.min(W, H) * 0.035));
+            if (bestDist > maxAssoc) bestTx = null;
+          }
+          if (bestTx) {
+            let set = txDetailGroups.get(bestTx);
+            if (!set) { set = new Set(); txDetailGroups.set(bestTx, set); }
+            set.add(g.gid);
+            detailRemainingGids.delete(g.gid);
+          }
+        }
+        plan.detailGroupsByTx = txDetailGroups;
+        plan.detailRemainingGids = detailRemainingGids;
+
+        // 不属于任何父对象的独立线条按“最小闭合归属对象”归入事务。
+        const tailLines = [];
+        const frameTxLines = [];
         for (const r of plan.lines) {
+          if (r.frameLike || r.canvasFrame) { frameTxLines.push(r); continue; }
+          const cx = (r.x0 + r.x1) * 0.5, cy = (r.y0 + r.y1) * 0.5;
+          let best = null, bestArea = Infinity;
+          for (const tx of transactions) {
+            for (const f of tx.items) {
+              if (f.mode === 'line' || f.pageGround || !inRegionHull(f, cx, cy)) continue;
+              const a = f.hullArea || f.fillArea || f.area;
+              if (a < bestArea) { bestArea = a; best = tx; }
+            }
+          }
+          // 细线常常只是字形/图案内部的一小段，中心点落在闭合 hull 外，
+          // 但它与所属对象的包围盒直接相交。按“bbox 距离最近、同距取更小
+          // 闭合对象”兜底，能把这些线并回正在画的对象；距离过大的独立
+          // 纸张细节仍留给最后的 tail，避免硬塞给无关图形。
+          if (!best) {
+            let bestDist = Infinity, bestHitArea = Infinity;
+            const maxAssoc = Math.max(18, Math.min(48, Math.min(W, H) * 0.035));
+            for (const tx of transactions) {
+              for (const f of tx.items) {
+                if (f.mode === 'line' || f.pageGround) continue;
+                const dx = Math.max(0, f.x0 - r.x1, r.x0 - f.x1);
+                const dy = Math.max(0, f.y0 - r.y1, r.y0 - f.y1);
+                const dist = Math.hypot(dx, dy);
+                const a = f.hullArea || f.fillArea || f.area;
+                if (dist < bestDist - 0.25 || (Math.abs(dist - bestDist) <= 0.25 && a < bestHitArea)) {
+                  bestDist = dist; bestHitArea = a; best = tx;
+                }
+              }
+            }
+            if (best && bestDist > maxAssoc) best = null;
+          }
+          if (best) best.lines.push(r);
+          else tailLines.push(r);
+        }
+        if (frameFills.length) {
+          const fr = frameFills[0];
+          for (const r of frameTxLines) {
+            const from = strokes.length;
+            // 画框内部若有独立线条，并入最早画框事务，而不是推迟到全图末尾。
+            paintLineRegion(r, Math.min(3, Math.max(2, r.depth + 1)));
+            tagTx(from, 'bg:' + fr.id);
+          }
+        } else tailLines.push(...frameTxLines);
+
+        const painted = new Set();
+        const paintObjectSubtree = (r, tx, seen) => {
+          if (!r || seen.has(r)) return;
+          seen.add(r);
+          if (fillSet.has(r) && !painted.has(r)) {
+            const from = strokes.length;
+            paintRegionBase(r);
+            tagTx(from, tx.root.id);
+            painted.add(r);
+          }
+          const kids = r.children.filter((ch) => txOfRegion.get(ch) === tx)
+            .sort((a, b) => childKey(a) - childKey(b));
+          for (const ch of kids) paintObjectSubtree(ch, tx, seen);
+          if (fillSet.has(r) && !painted.has(r)) return;
+          const from = strokes.length;
+          if (fillSet.has(r)) {
+            paintRegionRim(r);
+            paintRingSeam(r);
+          }
+          tagTx(from, tx.root.id);
+        };
+
+        let txDone = 0;
+        for (const tx of transactions) {
+          const fromTx = strokes.length;
+          const seen = new Set();
+          paintObjectSubtree(tx.root, tx, seen);
+          // 极端情况下根节点没有进入 fills：仍把该事务的 items 全部画完。
+          for (const r of tx.items) if (!painted.has(r)) {
+            const from = strokes.length;
+            paintRegionBase(r);
+            painted.add(r);
+            tagTx(from, tx.root.id);
+          }
+          const lines = tx.lines.slice().sort((a, b) => childKey(a) - childKey(b));
+          for (const r of lines) {
+            const from = strokes.length;
+            paintLineRegion(r, Math.min(3, Math.max(2, r.depth + 1)));
+            tagTx(from, tx.root.id);
+          }
+          const detailSet = txDetailGroups.get(tx);
+          if (detailSet && detailSet.size) {
+            const from = strokes.length;
+            await paintCompilerGroupDetails(noBgGroups, detailSet, tx.root.id);
+            tagTx(from, tx.root.id);
+          }
+          addObjectPause(fromTx, tx.root.id * 0.71 + txDone * 1.31);
+          txDone++;
+          prog(0.69 + 0.20 * txDone / Math.max(1, transactions.length),
+            '编译器：完成一个对象后再画下一个…');
+          if ((txDone & 3) === 0) await yieldUI();
+        }
+        // 不属于任何对象的细线只做最后一层，数量应远小于旧版全图线条阶段。
+        const tailSorted = tailLines.slice().sort((a, b) => childKey(a) - childKey(b));
+        for (let i = 0; i < tailSorted.length; i++) {
+          const r = tailSorted[i];
+          const from = strokes.length;
           paintLineRegion(r, Math.min(3, Math.max(2, r.depth + 1)));
-          done++;
-          if ((done & 15) === 0) {
-            prog(0.89 + 0.055 * done / Math.max(1, plan.lines.length), '编译器：顶层线条…');
+          tagTx(from, 'tail');
+          if ((i & 15) === 0) {
+            prog(0.885 + 0.008 * i / Math.max(1, tailSorted.length), '编译器：补齐独立细线…');
             await yieldUI();
           }
         }
+        if (opts.debug) console.log('[compiler:tx] objects=' + transactions.length +
+          ' linesAssigned=' + plan.lines.filter((r) => !tailLines.includes(r)).length +
+          ' tail=' + tailLines.length + ' frames=' + frameFills.length);
         // 不再做按组均值的小块回填：编译器已经有完整闭合 mask 和分层覆盖，
         // 额外均值补丁只会把蓝底重新切成云状色块。剩余误差交给对象内局部修正。
         // 局部修正：只在“当前图层所有权”内找高误差连通块，预算有限；
@@ -9514,7 +9778,7 @@
       // 合成过宽或过碎的候选。这里不重新铺底，只回到原图色组：细线沿骨架、
       // 小实心沿原始掩膜，在最上层按原色重画。zoneGid 严格裁回组内，因此
       // 不会把邻近底色或字心涂坏。
-      const paintCompilerGroupDetails = async (bgSet) => {
+      const paintCompilerGroupDetails = async (bgSet, groupFilter, txId, phaseProgress) => {
         // 紧凑碎片（小字、抗锯齿边缘）不再拆成骨架短段：用一条足够宽的
         // 定向笔扫过整个 bbox，再由 zoneGid 精确裁回该组掩膜。这样每个组
         // 只需一笔，却能覆盖掩膜里的所有离散笔画和像素拐角。
@@ -9599,7 +9863,7 @@
           return made;
         };
         const detail = groups.filter((g) => {
-          if (bgSet[g.gid] || g.area < 4) return false;
+          if ((groupFilter && !groupFilter.has(g.gid)) || bgSet[g.gid] || g.area < 4) return false;
           if (!g.lineLike && g.area > Math.max(900, N * 0.0015)) return false;
           // 组级收口不是重画全图：只挑当前画布仍有可见误差的组。小字碎组
           // 通常几乎整组都错，会完整走微型掩膜；已经画准的组直接跳过，
@@ -9619,7 +9883,33 @@
             }
           }
           return n > 0 && (bad >= Math.max(1, Math.ceil(n * 0.04)) || maxE >= 48);
-        }).sort((a, b) => (b.area - a.area));
+        }).sort((a, b) =>
+          (Math.floor(a.y0 / Math.max(24, Math.min(84, H * 0.065))) -
+           Math.floor(b.y0 / Math.max(24, Math.min(84, H * 0.065)))) ||
+          (a.x0 - b.x0) || (a.y0 - b.y0));
+        if (opts.debug && txId === 'detail:final') {
+          const assigned = new Set();
+          for (const set of compilerPlan.detailGroupsByTx.values()) for (const gid of set) assigned.add(gid);
+          const cat = {};
+          for (const g of detail) {
+            let page = 0, fg = 0, frame = 0, none = 0;
+            for (let yy = g.y0; yy <= g.y1; yy++) for (let xx = g.x0; xx <= g.x1; xx++) {
+              const p = yy * W + xx;
+              if (groupOf[p] !== g.gid) continue;
+              const rr = compilerPlan.owner[p] >= 0 ? compilerPlan.regions[compilerPlan.owner[p]] : null;
+              if (!rr) none++;
+              else if (rr.pageGround) page++;
+              else if (rr.frameLike || rr.canvasFrame) frame++;
+              else fg++;
+            }
+            const total = Math.max(1, page + fg + frame + none);
+            const who = page / total >= 0.5 ? 'page' : frame / total >= 0.5 ? 'frame' : fg / total >= 0.5 ? 'fg' : 'mixed';
+            const size = g.area < 64 ? 'tiny' : g.area < 400 ? 'small' : g.area < 2000 ? 'mid' : 'large';
+            const key = (g.lineLike ? 'line' : 'fill') + ':' + size + ':' + who + ':' + (assigned.has(g.gid) ? 'assigned' : 'unassigned');
+            cat[key] = (cat[key] || 0) + 1;
+          }
+          console.log('[compiler:detail-cats] ' + JSON.stringify(Object.fromEntries(Object.entries(cat).sort((a, b) => b[1] - a[1]))));
+        }
         let done = 0;
         for (const g of detail) {
           // 编译器的大区域已经写过一层，但小字/细线往往只是“被某个父色盖住”，
@@ -9646,15 +9936,17 @@
           for (let si = ds0; si < strokes.length; si++) {
             strokes[si].stage = compact ? 'compiler:detail-compact'
               : (g.lineLike ? 'compiler:detail-line' : 'compiler:detail-blob');
+            if (txId !== undefined) strokes[si].tx = txId;
           }
           done++;
-          if ((done & 31) === 0) {
-            prog(0.93 + 0.025 * done / Math.max(1, detail.length), '编译器：逐线和小形体收口…');
+          if (phaseProgress && (done & 31) === 0) {
+            prog(phaseProgress.a + (phaseProgress.b - phaseProgress.a) * done / Math.max(1, detail.length),
+              phaseProgress.label || '编译器：逐线和小形体收口…');
             await yieldUI();
           }
         }
-        if (opts.debug) console.log('[compiler:details] groups=' + detail.length +
-          ' strokes=' + strokes.length);
+        if (opts.debug && (!groupFilter || phaseProgress)) console.log('[compiler:details] groups=' + detail.length +
+          ' strokes=' + strokes.length + (groupFilter ? ' scoped=1 tx=' + txId : ' scoped=0'));
         await yieldUI();
       };
 
@@ -11162,8 +11454,12 @@
         await paintCompilerPlan();
         // 先按原色组补最后一层细线/小形体；重型对象执行器只作为可选实验，
         // 默认不启动，避免把已经由 compiler 画准的小字和圆点重新解释成宽扫块。
-        await paintCompilerGroupDetails(compilerPlan.pageParityUsed
-          ? new Uint8Array(G_) : compilerPlan.objectBgGids);
+        // 对象事务内先画一遍细节保证过程自然；所有对象结束后只收口那些
+        // 几何上无法归属到对象、且当前仍有可见误差的组。已随对象画准的组
+        // 不再做全图二次覆盖，避免片尾突然出现一大段补细节。
+        await paintCompilerGroupDetails(new Uint8Array(G_),
+          compilerPlan.detailRemainingGids,
+          'detail:final', { a: 0.93, b: 0.955, label: '编译器：补齐无对象归属的细节…' });
         if (opts.compilerObjectPass) await paintHumanFlow(true, compilerPlan.objectBgGids);
       } else if (closedActive) {
         await paintClosedPlan();
