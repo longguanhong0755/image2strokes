@@ -9281,7 +9281,23 @@
         // 子块仍是对象自己的分层（例如圆盘的奶油色内层），不能被背景过滤跳过。
         const pageAnchor = (a) => !!(a && a.mode === 'solid' && a.depth === 0 &&
           a.fillArea >= N * 0.4 && a.bw >= W * 0.75 && a.bh >= H * 0.75);
+        const pageEdgeFragment = (r) => {
+          const a = r && r.parent;
+          if (!pageAnchor(a)) return false;
+          const nearEdge = r.x0 <= W * 0.06 || r.x1 >= W * 0.94 ||
+            r.y0 <= H * 0.06 || r.y1 >= H * 0.94;
+          const narrow = r.bw <= W * 0.32 || r.bh <= H * 0.32;
+          const lowInk = r.rawFill <= 0.22;
+          const gap = Math.max(Math.abs(r.color[0] - a.color[0]),
+            Math.abs(r.color[1] - a.color[1]), Math.abs(r.color[2] - a.color[2]));
+          // Scanned page margins are often one long, thin, low-fill root that
+          // touches an edge and has nearly no interior of its own. Treating it
+          // as an object lets a single region span several text lines and bridge
+          // unrelated visual-line transactions.
+          return nearEdge && narrow && lowInk && gap <= 40;
+        };
         const backgroundLike = (r) => !!(r && ((r.pageGround && pageAnchor(r)) ||
+          pageEdgeFragment(r) ||
           (plan.normalized.has(r) && r.modelFrom !== undefined &&
             pageAnchor(plan.regions[r.modelFrom]))));
         const inRegionHull = (r, x, y) => {
@@ -9318,15 +9334,16 @@
           (r.frameLike || r.canvasFrame)).sort((a, b) => b.fillArea - a.fillArea);
         const backgroundSet = new Set(pageFills.concat(frameFills));
         for (const r of plan.fills) if (backgroundLike(r)) backgroundSet.add(r);
-        const paintRegionBase = (r) => {
+        const paintRegionBase = (r, baseOpts) => {
           const ph = regionPhase(r);
+          const skipOutline = !!(baseOpts && baseOpts.skipOutline);
           // 环形是真正的细线结构（字边、红描边、画框）：沿中心线绘制并逐段
           // 取局部原色，比用宽扫带覆盖整条环更贴近原图的明暗和抗锯齿。
           if (r.mode === 'ring') {
             if (r.children.length && r.hullMask) {
               // 外描边先绕边，再把闭合剪影完整铺成该层颜色。字心随后作为
               // 子区域覆盖中间，只留下描边和描边下方的抗锯齿底色。
-              if (r.outer) contourStroke(r, r.outer, ph, 'compiler:edge');
+              if (!skipOutline && r.outer) contourStroke(r, r.outer, ph, 'compiler:edge');
               fillParentMask(r, r.hullMask, ph, r.color, 'compiler:ring-parent');
             } else if (r.frameLike || r.thickness >= 12) {
               // 厚环不是一条中心线。按闭合环 mask 整块填满，避免粗画框
@@ -9346,7 +9363,7 @@
           // 页面根底板的 outer 会沿扫描纹理/文字造成的内部断裂绕行，
           // 在底板尚未铺完时提前描出 “MAIL” 等轮廓。根底板边界由
           // groundMask 扫带裁切和独立画框事务负责，这里只描真正的对象。
-          if (r.outer && !r.pageGround) contourStroke(r, r.outer, ph, 'compiler:edge');
+          if (!skipOutline && r.outer && !r.pageGround) contourStroke(r, r.outer, ph, 'compiler:edge');
           // 只有真正的页面根底板使用连续扫带。被归一进底色的较大色块
           // 仍保留真实填充（否则 s8/s9 的内层底板会被外层纸色吞掉），但
           // 必须按自己的闭合 mask 普通填充，不能各自再铺一遍整页扫带。
@@ -9437,6 +9454,82 @@
         const transactions = [...txMap.values()].sort((a, b) => readKey(a.root) - readKey(b.root));
         const txOfRegion = new Map();
         for (const tx of transactions) for (const r of tx.items) txOfRegion.set(r, tx);
+        // A glyph often has separate outline, fill and shadow roots, and scanned
+        // text is split into many roots. Ordering those roots independently makes
+        // one visual line appear as A -> M -> I -> R. Merge only the execution
+        // layer into geometry-derived visual-line transactions; region trees,
+        // masks, colors and stroke counts remain unchanged.
+        const txBox = (tx) => {
+          let x0 = W, y0 = H, x1 = -1, y1 = -1;
+          for (const r of tx.items) {
+            if (r.pageGround) continue;
+            if (r.x0 < x0) x0 = r.x0; if (r.y0 < y0) y0 = r.y0;
+            if (r.x1 > x1) x1 = r.x1; if (r.y1 > y1) y1 = r.y1;
+          }
+          if (x1 < x0 || y1 < y0) {
+            const r = tx.root;
+            x0 = r.x0; y0 = r.y0; x1 = r.x1; y1 = r.y1;
+          }
+          return { x0, y0, x1, y1, cx: (x0 + x1) * 0.5, cy: (y0 + y1) * 0.5 };
+        };
+        const mergeBox = (a, b) => {
+          const x0 = Math.min(a.x0, b.x0), y0 = Math.min(a.y0, b.y0);
+          const x1 = Math.max(a.x1, b.x1), y1 = Math.max(a.y1, b.y1);
+          return { x0, y0, x1, y1, cx: (x0 + x1) * 0.5, cy: (y0 + y1) * 0.5 };
+        };
+        // Use the smaller object scale so a tall initial can join its word,
+        // while neighboring rows, the airplane and following paragraphs cannot.
+        const sameVisualLine = (a, b) => {
+          const ha = Math.max(1, a.y1 - a.y0 + 1), hb = Math.max(1, b.y1 - b.y0 + 1);
+          const minH = Math.min(ha, hb);
+          const dy = Math.abs(a.cy - b.cy);
+          const overlapY = Math.max(0, Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0));
+          const gapX = Math.max(0, b.x0 - a.x1 - 1, a.x0 - b.x1 - 1);
+          const maxDy = Math.max(6, minH * 0.45);
+          const maxGapX = Math.max(8, minH * 0.58);
+          return gapX <= maxGapX && dy <= maxDy &&
+            (overlapY >= minH * 0.18 || dy <= minH * 0.30);
+        };
+        const txClusters = [];
+        for (const tx of transactions) {
+          let hit = null;
+          const box = txBox(tx);
+          for (const c of txClusters) {
+            if (sameVisualLine(c.box, box)) { hit = c; break; }
+          }
+          if (!hit) {
+            txClusters.push({ box, txs: [tx] });
+          } else {
+            hit.txs.push(tx);
+            hit.box = mergeBox(hit.box, box);
+            // A newly merged cluster may bridge two earlier clusters.
+            let changed = true;
+            while (changed) {
+              changed = false;
+              for (let i = txClusters.length - 1; i >= 0; i--) {
+                const other = txClusters[i];
+                if (other === hit || !sameVisualLine(hit.box, other.box)) continue;
+                hit.txs.push(...other.txs);
+                hit.box = mergeBox(hit.box, other.box);
+                txClusters.splice(i, 1);
+                changed = true;
+              }
+            }
+          }
+        }
+        for (const c of txClusters) {
+          c.txs.sort((a, b) => {
+            const aa = txBox(a), bb = txBox(b);
+            return (aa.x0 - bb.x0) || (aa.y0 - bb.y0) || (a.root.id - b.root.id);
+          });
+        }
+        txClusters.sort((a, b) => readKey({ y0: a.box.y0, x0: a.box.x0 }) -
+          readKey({ y0: b.box.y0, x0: b.box.x0 }));
+        plan.txGroups = txClusters;
+        if (opts.debug) console.log('[compiler:tx-groups] roots=' + transactions.length +
+          ' groups=' + txClusters.length + ' sizes=' +
+          txClusters.slice().sort((a, b) => b.txs.length - a.txs.length).slice(0, 10)
+            .map((c) => c.txs.length).join(','));
 
         // 组级细节也要跟着对象走：先按组内像素的归属对象投票，把每个
         // 前景细节组绑定到对应事务；未被任何对象认领的组仍留到最后，
@@ -9548,39 +9641,50 @@
         } else tailLines.push(...frameTxLines);
 
         const painted = new Set();
-        const paintObjectSubtree = (r, tx, seen) => {
-          if (!r || seen.has(r)) return;
-          seen.add(r);
-          if (fillSet.has(r) && !painted.has(r)) {
-            const from = strokes.length;
-            paintRegionBase(r);
-            tagTx(from, tx.root.id);
-            painted.add(r);
+        // 区域事务的内部阶段。单个对象仍按原来的“绕边→填色→子层→细节”
+        // 顺序执行；同一视觉行有多个对象时，则把整行按阶段推进，避免出现
+        // A 全部画完后才轮到 I/R 的逐字跳画。
+        const paintRegionOutline = (r) => {
+          if (!r || r.pageGround || !fillSet.has(r)) return;
+          const ph = regionPhase(r);
+          if (r.mode === 'ring') {
+            if (r.children.length && r.outer) contourStroke(r, r.outer, ph, 'compiler:edge');
+            return;
           }
-          const kids = r.children.filter((ch) => txOfRegion.get(ch) === tx)
-            .sort((a, b) => childKey(a) - childKey(b));
-          for (const ch of kids) paintObjectSubtree(ch, tx, seen);
-          if (fillSet.has(r) && !painted.has(r)) return;
-          const from = strokes.length;
-          if (fillSet.has(r)) {
+          // 细环内部阴影沿中心线绘制，外轮廓已在父环阶段处理。
+          if (r.parent && r.parent.mode === 'ring' && r.thickness <= 6.5) return;
+          if (r.outer) contourStroke(r, r.outer, ph, 'compiler:edge');
+        };
+        const walkTxRegions = (tx, enter, leave) => {
+          const seen = new Set();
+          const walk = (r) => {
+            if (!r || seen.has(r)) return;
+            seen.add(r);
+            if (enter) enter(r);
+            const kids = r.children.filter((ch) => txOfRegion.get(ch) === tx)
+              .sort((a, b) => childKey(a) - childKey(b));
+            for (const ch of kids) walk(ch);
+            if (leave) leave(r);
+          };
+          walk(tx.root);
+          // 极端情况下根节点没有进入 fills：其 items 仍必须完成。
+          for (const r of tx.items) {
+            if (seen.has(r)) continue;
+            seen.add(r);
+            if (enter) enter(r);
+            if (leave) leave(r);
+          }
+        };
+        const paintTransactionEdges = (tx) => {
+          walkTxRegions(tx, null, (r) => {
+            if (!fillSet.has(r)) return;
+            const from = strokes.length;
             paintRegionRim(r);
             paintRingSeam(r);
-          }
-          tagTx(from, tx.root.id);
-        };
-
-        let txDone = 0;
-        for (const tx of transactions) {
-          const fromTx = strokes.length;
-          const seen = new Set();
-          paintObjectSubtree(tx.root, tx, seen);
-          // 极端情况下根节点没有进入 fills：仍把该事务的 items 全部画完。
-          for (const r of tx.items) if (!painted.has(r)) {
-            const from = strokes.length;
-            paintRegionBase(r);
-            painted.add(r);
             tagTx(from, tx.root.id);
-          }
+          });
+        };
+        const paintTransactionDetails = async (tx) => {
           const lines = tx.lines.slice().sort((a, b) => childKey(a) - childKey(b));
           for (const r of lines) {
             const from = strokes.length;
@@ -9593,11 +9697,65 @@
             await paintCompilerGroupDetails(noBgGroups, detailSet, tx.root.id);
             tagTx(from, tx.root.id);
           }
-          addObjectPause(fromTx, tx.root.id * 0.71 + txDone * 1.31);
-          txDone++;
-          prog(0.69 + 0.20 * txDone / Math.max(1, transactions.length),
-            '编译器：完成一个对象后再画下一个…');
-          if ((txDone & 3) === 0) await yieldUI();
+        };
+        const paintTransaction = async (tx) => {
+          walkTxRegions(tx, (r) => {
+            if (!fillSet.has(r) || painted.has(r)) return;
+            const from = strokes.length;
+            paintRegionBase(r);
+            painted.add(r);
+            tagTx(from, tx.root.id);
+          }, (r) => {
+            if (!fillSet.has(r)) return;
+            const from = strokes.length;
+            paintRegionRim(r);
+            paintRingSeam(r);
+            tagTx(from, tx.root.id);
+          });
+          await paintTransactionDetails(tx);
+        };
+        const paintStagedCluster = async (cluster) => {
+          // 按包含深度成组推进整行：深度 0 的所有根对象先一起绕边、
+          // 铺父色；随后整行一起进入下一层子区域。这样既保留“父色覆盖
+          // 内部、子层再盖回来”的正确层级，也不会出现 A 全部完成后才
+          // 开始 I/R 的逐字跳画。
+          const bands = new Map();
+          for (const tx of cluster.txs) {
+            walkTxRegions(tx, (r) => {
+              if (!fillSet.has(r) || painted.has(r)) return;
+              const d = Number.isFinite(r.depth) ? r.depth : 0;
+              let band = bands.get(d);
+              if (!band) { band = []; bands.set(d, band); }
+              band.push(r);
+            }, null);
+          }
+          const depths = [...bands.keys()].sort((a, b) => a - b);
+          for (const d of depths) {
+            for (const r of bands.get(d)) {
+              const tx = txOfRegion.get(r);
+              const from = strokes.length;
+              paintRegionOutline(r);
+              paintRegionBase(r, { skipOutline: true });
+              painted.add(r);
+              if (tx) tagTx(from, tx.root.id);
+            }
+            await yieldUI();
+          }
+          // 所有父子区域落定后，再从内向外补边缘。最后才是该行自己的
+          // 细线和原色组细节，避免它们被后续父色填充覆盖。
+          for (const tx of cluster.txs) paintTransactionEdges(tx);
+          for (const tx of cluster.txs) await paintTransactionDetails(tx);
+        };
+        let groupDone = 0;
+        for (const cluster of txClusters) {
+          const fromGroup = strokes.length;
+          if (cluster.txs.length > 1) await paintStagedCluster(cluster);
+          else await paintTransaction(cluster.txs[0]);
+          addObjectPause(fromGroup, cluster.box.x0 * 0.71 + cluster.box.y0 * 1.31 + groupDone * 2.17);
+          groupDone++;
+          prog(0.69 + 0.20 * groupDone / Math.max(1, txClusters.length),
+            '编译器：按视觉行成组推进…');
+          if ((groupDone & 3) === 0) await yieldUI();
         }
         // 不属于任何对象的细线只做最后一层，数量应远小于旧版全图线条阶段。
         const tailSorted = tailLines.slice().sort((a, b) => childKey(a) - childKey(b));
