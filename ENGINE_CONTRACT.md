@@ -9,7 +9,7 @@ Worker（classic worker）里：
 
 ```js
 self.ISP_ENGINE_BASE = 'https://longguanhong0755.github.io/image2strokes/js/';
-importScripts(self.ISP_ENGINE_BASE + 'engine.js?v=42');
+importScripts(self.ISP_ENGINE_BASE + 'engine.js?v=46');
 const res = await self.ISP_PIPELINE.run(px, W, H, opts, onProgress);
 ```
 
@@ -22,10 +22,10 @@ const res = await self.ISP_PIPELINE.run(px, W, H, opts, onProgress);
 ```js
 self.ISP_PIPELINE = {
   api: 1,
-  version: '61',
+  version: '65',
   run(px, W, H, opts, onProgress) -> Promise<{
     W, H,
-    strokes: [{ rib, tp, color, vis?, fin?, ... }],
+    strokes: [{ rib, tp, color, vis?, fin?, tx?, txKind?, txSeq?, step?, ... }],
     clips: [{ mask, ... }],
     stats: { ... },
     dbg?: { ... }
@@ -109,6 +109,18 @@ self.ISP_PIPELINE = {
   `stats.exactOrder='painter'`；第二遍画了闭合外框时 `stats.ring=true`（标签"勾外框"），
   否则是逐组补准背景（标签"补背景"）。`stats.bgFill`：`'once'` 主色背景一趟刷满 /
   `'wash'` 逐组补准；是否铺满按面积/贴边/颜色均匀度自动判定，不按图的类型特判）。
+- **compiler 事务扩展（可选字段，旧消费方可以完全忽略）**：
+  `tx` 是事务 id，`txSeq` 是从 0 开始且严格递增的事务序号，`txKind` 是
+  `pageBase | object | detail | tail`，`step` 是 `outline | fill | child | rim | line | detail`。
+  同一事务的笔触在 `strokes` 中连续出现；下一事务只会在上一事务全部落完后开始。
+  `stats.transactions` 给出 `{id, seq, kind, strokeStart, strokeEnd, steps, x0, y0, x1, y1}`，
+  `stats.txCounts` / `stats.txOrder` 分别是按 kind 的计数和实际执行顺序。
+  `pageBase` 若存在必须是第一个事务：它用整页剪影原子铺底，再原子覆盖画框，然后才补纹理；
+  不会有前景对象在底板事务结束前开始。`object` 事务按视觉行从上到下、行内从左到右执行，
+  单个对象内部固定为父轮廓 → 父剪影填色 → 子区域覆盖 → 边缘/线条/细节 → 局部修正。
+  网页回放按这些边界生成时间轴：底板事务约 2.2~2.8 秒，每个对象事务至少约 650ms，
+  事务之间留出抬笔停顿，最后一笔完成后再停留约 1.3 秒；时间轴不设 90 秒硬上限，
+  `STATS.totalMs` 必须覆盖最后一笔及其停留时间。
 - `onProgress(p, msg)`：`p` 是 0~1
 - `stats.fidelity` 是本次实际使用的还原档位（1~5）；`stats.detail` 保留给老消费方。
 - 四种算法都返回 `stats.quality`。`layer/pyramid`：`{tolerance, bucketT, max, mean, gt8, gt24, gt48,
@@ -124,7 +136,7 @@ self.ISP_PIPELINE = {
   `dbg.artist.exact`（`debug:true` 时）结构为：`{seed, mode:'flat'|'photo', regions, groups, strokes,
   mergePasses, uncovered, uncoveredGroups, residualPx, residualComps, residualStrokes,
   zeroRemoved, rimPx, paintable, ms, order, bgFill, ring, bgGroups, washPx, elements,
-  compilerMode}`。`dbg.artist.exact.mode` 是实际走的策略
+  compilerMode, transactions, txCounts, txOrder}`。`dbg.artist.exact.mode` 是实际走的策略
   （`flat` = 封闭色块，`photo` = 细色区）；`order='bgfirst'` 表示平涂走了“背景先行 + 元素块”排法
   （`bgGroups` = 背景块数、`elements` = 前景元素块数），`order='painter'` 是画家·过程版的
   人画流程（铺满整页 → 勾外框/补背景 → 逐个对象先描外轮廓、整块填满、再补内部细节 →
@@ -159,8 +171,10 @@ self.ISP_PIPELINE = {
 - `pipeline.js` 内部怎么改都行；**只要 `run()` 的入参/返回结构不变，`api` 就不动**。
 - 破坏性改动：`api + 1`，并且**保留旧 api 的入口**（例如 `engine-v2.js`），
   旧消费者继续走旧入口。不能直接改 `engine.js` 的语义。
-- `engine.js` 的 `?v=` 只在入口文件本身变化时递增。
-- 新引擎上线前跑 `node dev/engine_check.mjs`；CI 也会跑。
+- `engine.js` 的 `?v=` 只在入口文件本身变化时递增；当前链路为
+  `engine.js?v=46 → pipeline.js?v=65 → worker.js?v=67 → app.js?v=79`。
+- 新引擎上线前跑 `node dev/engine_check.mjs`；CI 也会跑。编译器回归覆盖底板先行、
+  事务连续性/包围盒、视觉行左右顺序、时间轴覆盖最后一笔以及 90 秒硬上限已移除。
 
 ## 消费者怎么锁版本
 

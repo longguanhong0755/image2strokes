@@ -28,6 +28,9 @@ let extracting = false;           // 正在提炼：期间不接受第二次选�
 // "像人在画"需要的三段时间轴：抬笔移动 travel + 换阶段停顿 beat + 落笔绘制 paint
 let travels = null, beats = null, msPaint = null;
 let targetMs = 240000;          // 每次提炼后按笔数自动定（见 buildTimeline）
+let finishHoldMs = 0;           // 最后一笔落完后停留多久再显示“画完了”
+let finishHoldTimer = 0;
+let finishHoldStarted = 0;
 let airPath = null;             // 抬笔移动的弧线（画在纸面上的淡虚线）
 const lastEnd = [0, 0];         // 上一笔收笔的位置（抬笔弧线的起点）
 let algo = 'artist';            // 当前算法：artist 画家模式 / layer 分层宽笔 / pyramid 逐级细化
@@ -153,7 +156,7 @@ function startExtract(imgCanvas) {
     seed: runSeed,
   };
   if (!worker) {
-    worker = new Worker('js/worker.js?v=66');
+    worker = new Worker('js/worker.js?v=67');
     worker.onmessage = onWorker;
     worker.onerror = (e) => { setExtracting(false); note('出错：' + e.message, 'err'); };
   }
@@ -246,13 +249,125 @@ function strokeCost(st) {
   return isFinite(ms) && ms > 0 ? ms : 4;
 }
 
+// compiler 时间轴按事务排，不再按总笔数压成固定 90 秒：
+// - 原子色块 100~180ms 一次落下；
+// - 轮廓/中心线按实际路径长度给 24~420ms；
+// - 页面底板事务在开头约 2.2~2.8 秒内完整结束；
+// - 每个对象事务至少 650ms，事务之间留 180~330ms 抬笔停顿；
+// - 最后一笔完成后停留 1.3 秒再结束。
+// 这个纯函数不依赖 DOM / 全局回放状态，engine_check 会直接执行它做时间轴回归。
+function planCompilerTimeline(strokes, seed) {
+  const n = strokes.length;
+  const clamp = (v, a, b) => (v < a ? a : (v > b ? b : v));
+  const hash01 = (a, b) => {
+    const x = Math.sin(a * 127.1 + b * 311.7) * 43758.5453;
+    return x - Math.floor(x);
+  };
+  const pathLength = (st) => {
+    const tp = st && st.tp;
+    if (!tp || tp.length < 4) return 0;
+    let len = 0;
+    for (let i = 1; i < tp.length / 2; i++) {
+      len += Math.hypot(tp[i * 2] - tp[(i - 1) * 2], tp[i * 2 + 1] - tp[(i - 1) * 2 + 1]);
+    }
+    return len;
+  };
+  const runSeed = Number.isFinite(+seed) ? (+seed >>> 0) : 0;
+  const travels = new Float64Array(n);
+  const beats = new Float64Array(n);
+  const msPaint = new Float64Array(n);
+  const groups = [];
+  if (!n) {
+    return {
+      travels, beats, msPaint, cumMs: new Float64Array(1),
+      groups, finishHoldMs: 0, totalMs: 0,
+    };
+  }
+  let cur = null;
+  for (let i = 0; i < n; i++) {
+    const st = strokes[i];
+    const key = Number.isInteger(st.txSeq) ? ('s:' + st.txSeq)
+      : (st.tx === undefined ? 'legacy' : ('i:' + String(st.tx)));
+    if (!cur || cur.key !== key) {
+      cur = { key, start: i, end: i + 1, kind: st.txKind || 'legacy' };
+      groups.push(cur);
+    } else cur.end = i + 1;
+  }
+  for (let gi = 0; gi < groups.length; gi++) {
+    const g = groups[gi];
+    const len = g.end - g.start;
+    const durs = new Float64Array(len);
+    let raw = 0;
+    for (let j = 0; j < len; j++) {
+      const i = g.start + j;
+      const st = strokes[i];
+      const step = st.step || (st.blk ? 'fill' : 'detail');
+      const h = hash01(i * 1.37 + runSeed * 0.031, 3.9);
+      let d;
+      if (g.kind === 'pageBase' && step === 'detail') {
+        // 底板纹理只做细察，不阻塞第一个前景对象；原子蓝底与黑框仍各占
+        // 一个可见节拍，整页底色与画框在事务开头就已完整出现。
+        d = 0.7 + h * 0.8;
+      } else if (step === 'fill') {
+        d = st.blk ? 100 + h * 80 : 35 + h * 70;
+      } else if (step === 'outline' || step === 'line') {
+        d = clamp(24 + pathLength(st) * 0.55, 24, 420) * (0.84 + h * 0.32);
+      } else if (g.kind === 'detail' || g.kind === 'tail') {
+        d = 8 + h * 12;
+      } else {
+        d = 10 + h * 30;
+      }
+      durs[j] = d;
+      raw += d;
+    }
+    let want = raw;
+    if (g.kind === 'pageBase') want = clamp(raw, 2200, 2800);
+    else if (g.kind === 'object') want = Math.max(650, raw);
+    else want = Math.max(260, raw);
+    const k = raw > 0 ? want / raw : 0;
+    for (let j = 0; j < len; j++) {
+      const i = g.start + j;
+      msPaint[i] = Math.max(0.25, durs[j] * k);
+      if (gi > 0 && j === 0) {
+        beats[i] += 180 + hash01(gi * 1.91 + runSeed * 0.017, 8.2) * 150;
+      }
+    }
+  }
+  const cumMs = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) cumMs[i + 1] = cumMs[i] + travels[i] + beats[i] + msPaint[i];
+  for (const g of groups) {
+    g.beginMs = cumMs[g.start];
+    g.endMs = cumMs[g.end];
+  }
+  const finishHoldMs = 1300;
+  return { travels, beats, msPaint, cumMs, groups, finishHoldMs, totalMs: cumMs[n] + finishHoldMs };
+}
+
+function buildCompilerTimeline(n) {
+  if (finishHoldTimer) { clearTimeout(finishHoldTimer); finishHoldTimer = 0; }
+  finishHoldStarted = 0;
+  const planned = planCompilerTimeline(STROKES, RUN_SEED);
+  travels = planned.travels;
+  beats = planned.beats;
+  msPaint = planned.msPaint;
+  cumMs = planned.cumMs;
+  finishHoldMs = planned.finishHoldMs;
+  targetMs = planned.totalMs;
+  if (STATS) STATS.totalMs = targetMs;
+  if (n) {
+    lastEnd[0] = STROKES[0].tp[0];
+    lastEnd[1] = STROKES[0].tp[1];
+  }
+}
 // 时间轴：每笔 = 抬笔移动(短) + 换阶段停顿(偶尔) + 落笔绘制；总时长按笔数自动定
 function buildTimeline() {
   const n = STROKES.length;
+  if (algo === 'compiler') { buildCompilerTimeline(n); return; }
+  finishHoldMs = 0;
   // 时长不再让用户选：画家模式按"有限笔数、看得清起承转合"给 30~90 秒；
   // 像素重建的旧模式仍按笔数给 150 秒起、8 分钟封顶。
   // 极简图（两横一竖这类，就几笔）不顶 30 秒下限：每笔 ~1.1 秒，几秒画完。
-  targetMs = (algo === 'artist' || algo === 'painter' || algo === 'compiler')
+  targetMs = (algo === 'artist' || algo === 'painter')
     ? (n < 20
         ? clamp(Math.round(n * 1100), 3200, 30000)
         : clamp(Math.round(n * 24), 30000, 90000))
@@ -716,7 +831,7 @@ function tick() {
       paintStroke(idx, 1);
       idx++;
       if (keyEvery && idx % keyEvery === 0 && idx < STROKES.length) snapshotKey(idx);
-      if (idx >= STROKES.length) { finish(); break; }
+      if (idx >= STROKES.length) { finishWithHold(); break; }
       // 10× 速度下一帧可能要画上百笔：给主线程留时间，别整帧卡死（画面落后由下一帧补）
       if ((guard & 15) === 0 && performance.now() - t0 >= 12) break;
     }
@@ -786,7 +901,7 @@ function hud() {
   if (!STATS) return;
   const n = STROKES.length;
   const st = n ? STROKES[Math.min(idx, n - 1)] : null;
-  const cur = done ? STATS.totalMs : (cumMs[idx] + acc);
+  const cur = done || finishHoldTimer ? STATS.totalMs : (cumMs[idx] + acc);
   const p = STATS.totalMs > 0 ? cur / STATS.totalMs : 0;
   $('fill').style.width = (p * 100).toFixed(2) + '%';
   $('clock').textContent = fmt(cur / 1000) + ' / ' + fmt(STATS.totalMs / 1000);
@@ -816,6 +931,7 @@ function fmt(s) {
 }
 
 function resetPlayback() {
+  cancelFinishHold();
   idx = 0; acc = 0; done = false; rushing = false; cursor = null; guide = null; airPath = null;
   pending = -1; pendRect = null;
   const ctx = painted.getContext('2d');
@@ -829,6 +945,7 @@ function resetPlayback() {
 }
 
 function jumpTo(sec) {
+  cancelFinishHold();
   const tgt = sec * 1000;
   const cur = done ? cumMs[STROKES.length] : (cumMs[idx] + acc);
   // 向前小步：直接在当前画面上续画，不用重来
@@ -1016,7 +1133,28 @@ function diffVsTarget() {
   return { mean: sum / tot, badPct: bad / (W * H) * 100, mean4: s2 / t2, bad4: b2 / (w2 * h2) * 100 };
 }
 
+function cancelFinishHold() {
+  if (finishHoldTimer) clearTimeout(finishHoldTimer);
+  finishHoldTimer = 0;
+  finishHoldStarted = 0;
+}
+
+// 自然播放到最后时不立刻切“画完了”，先让最后一笔在画面上停留；
+// 拖动进度/看成品/导出属于用户主动结束，仍走即时 finish。
+function finishWithHold() {
+  if (done) return;
+  if (!(finishHoldMs > 0)) { finish(); return; }
+  if (finishHoldTimer) return;
+  finishHoldStarted = performance.now();
+  finishHoldTimer = setTimeout(() => {
+    finishHoldTimer = 0;
+    finishHoldStarted = 0;
+    if (!done) finish();
+  }, finishHoldMs);
+}
+
 function finish() {
+  cancelFinishHold();
   done = true; playing = false; rushing = false; cursor = null; guide = null; airPath = null;
   $('play').textContent = '重播';
   setPhase(PHASES.length);           // 全部阶段标记完成，不要点亮“落款”
@@ -1280,7 +1418,7 @@ function buildExportData() {
   return {
     v: 1, W, H, n,
     keyEvery: Math.max(300, Math.ceil(n / 8)),
-    totalMs: Math.round(cumMs[n]),
+    totalMs: Math.round(cumMs[n] + finishHoldMs),
     phases: PHASES.slice(),
     clips: clipsOut, strokes: strokesOut, sched,
   };
@@ -2406,4 +2544,4 @@ async function hardRefresh() {
 bindUI();
 schedule();
 // 版本戳：标签页标题带 b70 = 已在跑最新代码（排查缓存问题用）
-document.title += ' · b74';
+document.title += ' · b79';
