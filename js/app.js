@@ -153,7 +153,7 @@ function startExtract(imgCanvas) {
     seed: runSeed,
   };
   if (!worker) {
-    worker = new Worker('js/worker.js?v=64');
+    worker = new Worker('js/worker.js?v=66');
     worker.onmessage = onWorker;
     worker.onerror = (e) => { setExtracting(false); note('出错：' + e.message, 'err'); };
   }
@@ -503,6 +503,9 @@ function paintStroke(i, u, dest) {
   const t = tipAt(st, u);
   cursor = { x: t.x, y: t.y, r: Math.max(2.5, st.w * 0.5), pen: st.pen, color: st.color };
   guide = st.tp;
+  // 原子色块在槽位开始后才出现，但一旦出现就是完整色块；不再按扫描线
+  // 露出中间态。轮廓/细线仍然走正常的 u 进度绘制。
+  if (st.blk && u <= 0) return false;
   const rgb = 'rgb(' + st.color[0] + ',' + st.color[1] + ',' + st.color[2] + ')';
   const rect = { x: cl.x, y: cl.y, w: cl.w, h: cl.h };
   // tmp 画布只留格子大小（不够就长，绝不缩）：每笔的 clearRect/fill/stroke/掩膜合成
@@ -517,7 +520,7 @@ function paintStroke(i, u, dest) {
   tmp.save();
   tmp.fillStyle = rgb;
   tmp.strokeStyle = rgb;
-  if (u >= 1) {
+  if (st.blk || u >= 1) {
     // 整笔：先填笔形，再沿笔形描一圈同色细边（约 0.7px）。
     // 这样抗锯齿产生的"半透明毛边"变成实心，两个色块相接处不会露出 1px 白缝
     // ——白点的根源之一就是这个（详见 README 的坑）。
@@ -560,7 +563,7 @@ function paintStroke(i, u, dest) {
   tmp.globalCompositeOperation = 'source-over';
   const ctx = (dest || painted).getContext('2d');
   ctx.drawImage(tmpC, 0, 0, rect.w, rect.h, rect.x, rect.y, rect.w, rect.h);
-  if (u >= 1) {
+  if (st.blk || u >= 1) {
     pending = -1; pendRect = null;
     lastEnd[0] = t.x; lastEnd[1] = t.y;      // 记下收笔位置，下一笔的抬笔弧线从这里起
     return true;
@@ -1270,7 +1273,7 @@ function buildExportData() {
   const sched = new Array(n * 2);
   for (let i = 0; i < n; i++) {
     const s = STROKES[i];
-    strokesOut[i] = { rib: s.rib, tp: s.tp, w: s.w, color: s.color, pen: s.pen || 0, ph: s.ph, c: idxMap.get(s.c), fin: s.fin || 0 };
+    strokesOut[i] = { rib: s.rib, tp: s.tp, w: s.w, color: s.color, pen: s.pen || 0, ph: s.ph, c: idxMap.get(s.c), fin: s.fin || 0, blk: s.blk || 0 };
     sched[i * 2] = Math.round(cumMs[i] + travels[i] + beats[i]);   // 这一笔开始落色
     sched[i * 2 + 1] = Math.round(cumMs[i + 1]);                   // 这一笔结束（含抬笔/停顿）
   }
@@ -1474,6 +1477,7 @@ function exportedPlayer() {
     const t = tipAt(st, u);
     cursor = { x: t.x, y: t.y, r: Math.max(2.5, st.w * 0.5), pen: st.pen, color: st.color };
     guide = st.tp;
+    if (st.blk && u <= 0) return false;
     const rgb = 'rgb(' + st.color[0] + ',' + st.color[1] + ',' + st.color[2] + ')';
     const rect = { x: cl.x, y: cl.y, w: cl.w, h: cl.h };
     if (tmpC.width < rect.w || tmpC.height < rect.h) {   // tmp 只留格子大小，按需长大
@@ -1486,7 +1490,7 @@ function exportedPlayer() {
     tmp.save();
     tmp.fillStyle = rgb;
     tmp.strokeStyle = rgb;
-    if (u >= 1) {
+    if (st.blk || u >= 1) {
       const pth = ribbonPath(st);
       tmp.lineWidth = 1.4;
       tmp.lineJoin = 'round';
@@ -1524,7 +1528,7 @@ function exportedPlayer() {
     tmp.drawImage(maskC, 0, 0);
     tmp.globalCompositeOperation = 'source-over';
     painted.getContext('2d').drawImage(tmpC, 0, 0, rect.w, rect.h, rect.x, rect.y, rect.w, rect.h);
-    if (u >= 1) {
+    if (st.blk || u >= 1) {
       pending = -1; pendRect = null;
       lastEnd[0] = t.x; lastEnd[1] = t.y;
       return true;
