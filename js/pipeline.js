@@ -10,6 +10,9 @@
   'use strict';
 
   // 由 run() 从 opts 灌进来的开关（画笔形的工具函数在 run 外面，拿不到 opts）
+  // 当前还原程度（1 省笔 … 5 极致）：编译器各阶段读它决定"补多细"，
+  // 档位差异才落在细节密度上，而不是只改几个补笔预算。
+  let COMPILER_FID = 3;
   let CAPFIX = true;              // ribbonProf 两端圆头扫正前方（老代码扫侧后方 = 端头缺半个圆 + 啃笔身）
   let PROF_FLAT_SAMPLE = true;    // 细长层取色用"平头"变宽笔形（与 ribbon 的 noCap 一致）
 
@@ -9406,7 +9409,10 @@
               ' filtered=' + filteredGroups + ' strokes=' + made + ' root=' + r.id);
             return made;
           }
-          const cellPx = Math.max(32, Math.round(Math.min(W, H) * 0.055));
+          // 底色格边长随还原程度缩放：省笔档格子更大（几笔铺完），
+          // 极致档更小（色场起伏跟得更紧）。基准 = 5.5% 短边。
+          const cellScale = [1.45, 1.20, 1, 0.84, 0.70][COMPILER_FID - 1];
+          const cellPx = Math.max(24, Math.round(Math.min(W, H) * 0.055 * cellScale));
           // 纸面（近白）底色片单独按组一次铺平：格子把"白纸 + 浅色圆盘"
           // 混在一格里会平均成中间色，成品就出现"底色铺满整幅画"和一圈白边。
           for (const g of groups) {
@@ -10186,7 +10192,9 @@
         const repairStart = strokes.length;
         const REPAIR_ERR = 20;
         // 碎片面积下限：小于这个面积的误差块不值得单独起一笔。
-        const repairMinPx = Math.max(12, Math.round(Math.min(W, H) * 0.014));
+        // 下限按还原程度缩放（省笔档更粗、极致档更细），否则档位就形同虚设。
+        const repairMinPx = Math.max(12, Math.round(
+          Math.min(W, H) * [0.030, 0.021, 0.014, 0.009, 0.006][COMPILER_FID - 1]));
         const maxRepairStrokes = Math.min(7000, Math.max(1000, Math.round(N * 0.0080)));
         const seen = new Uint8Array(N);
         const q = new Int32Array(N);
@@ -10488,11 +10496,14 @@
               if (e > maxE) maxE = e;
             }
           }
-          // 判定"这个组还值得再动一笔"：要么有一小片（≥3px 且 ≥6%）明显偏差，
+          // 判定"这个组还值得再动一笔"：要么有一小片（≥Npx 且 ≥P%）明显偏差，
           // 要么整组面积够大且峰值偏差极高。旧条件只要 1 个像素 maxE≥48 就重画，
           // 于是边界上的抗锯齿碎组被反复描成小点。
-          return n > 0 && (bad >= Math.max(3, Math.ceil(n * 0.06)) ||
-            (maxE >= 48 && n >= 24));
+          // N/P 随还原程度缩放：省笔档只补大块，极致档才去啃 2px 的碎边。
+          return n > 0 && (bad >= Math.max([8, 5, 3, 2, 2][COMPILER_FID - 1],
+            Math.ceil(n * [0.12, 0.09, 0.06, 0.040, 0.025][COMPILER_FID - 1])) ||
+            (maxE >= [64, 56, 48, 40, 32][COMPILER_FID - 1] &&
+             n >= [64, 40, 24, 16, 12][COMPILER_FID - 1]));
         }).sort((a, b) =>
           (Math.floor(a.y0 / Math.max(24, Math.min(84, H * 0.065))) -
            Math.floor(b.y0 / Math.max(24, Math.min(84, H * 0.065)))) ||
@@ -14024,6 +14035,7 @@
     }
     fid = Math.max(1, Math.min(5, Math.round(+fid) || 3));
     opts.fidelity = fid;
+    COMPILER_FID = fid;
     // 档位差异全部落在“补笔要补多细”上：轮数、阈值、补漏切分、笔数上限；
     // 主笔触的取色/分区逻辑不动，所以低档只是少补细节，不会把画面画歪。
     // 只覆盖仍是默认值的项：调用方显式传的参数优先（外部项目可以自己微调）。
