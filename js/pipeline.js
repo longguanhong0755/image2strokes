@@ -4111,12 +4111,16 @@
       for (let i = 0; i < mask.length; i++) if (mask[i]) nInk++;
       if (nInk <= 0) return -1;
       const cIdx = pushClip(x0, y0, bw, bh, mask);
-      const x1 = x0 + bw - 1, y1 = y0 + bh - 1;
-      const cy = y0 + (bh - 1) * 0.5;
+      // 几何按"覆盖到最后一个像素的外沿"算：用 x0+bw 而不是 x0+bw-1。
+      // 旧写法把右下各缩了 1px，最后一列/最后一行的像素中心落在矩形外，
+      // 只有 0.7px 的描边光泽进去，于是海报最右一列被混成 (76,76,76) 灰边。
+      // 形状仍由裁剪掩膜决定，所以不会涂到区域外。
+      const x1 = x0 + bw, y1 = y0 + bh;
+      const cy = y0 + bh * 0.5;
       const st = {
         // 矩形只负责覆盖 bbox；着色边界始终由裁剪掩膜决定。
         rib: [x0, y0, x1, y0, x1, y1, x0, y1],
-        tp: [x0, cy, x0 + (bw - 1) * 0.5, cy, x1, cy],
+        tp: [x0, cy, x0 + bw * 0.5, cy, x1, cy],
         w: Math.max(4, Math.min(bw, bh) * 0.4),
         color: [Math.round(color[0]), Math.round(color[1]), Math.round(color[2])],
         pen: 0, c: cIdx, r: -1, ph: ph, ly: -1,
@@ -4130,6 +4134,10 @@
       if (opts.tagStrokes && opt.zoneGid !== undefined) st.zg = opt.zoneGid;
       strokes.push(st);
       const col = st.color;
+      // 纯"纸底"笔（整幅铺底）只服务回放：它让播放器在开局就有一张有底色的纸，
+      // 但绝不能改写引擎的画布/误差账——否则后续按 canvas 误差做的"已达标就跳过"
+      // 判断会被这一层假底色误导，成品反而变差。
+      if (opt.noCanvas) return strokes.length - 1;
       const noCover = !!opt.noCover, noZone = !!opt.noZone;
       for (let y = 0; y < bh; y++) {
         const row = (y0 + y) * W, mr = y * bw;
@@ -9095,8 +9103,42 @@
           const pieces = Math.max(1, Math.ceil(total / maxLen));
           const target = total / pieces;
           const zmr = { m: r.fillMask, x0: r.x0, y0: r.y0, w: r.bw, h: r.bh };
-          const hw = clamp((r.mode === 'ring' ? r.thickness * 0.42 : r.thickness * 0.24) + 1.4,
-            1.5, 6.2) * Math.min(1.15, scaleB + 0.12);
+          // 外轮廓这一笔只负责"封住接缝"，不负责画墨线本身：
+          // 墨线由该色组自己的细线笔（compiler:line / ink-line）画。
+          // 旧公式按区域厚度给笔身（厚区域 → 6~7px 半径），于是猫身奶油色
+          // 被啃掉一圈、墨线被撑成 13px 宽——看起来就是"轮廓很假"。
+          // 现在固定成 2~4px 的窄带，并整体向外偏半像素，正好压在抗锯齿边上。
+          const hw = clamp((r.mode === 'ring' ? r.thickness * 0.10 : r.thickness * 0.05) + 1.25,
+            1.15, 2.2) * Math.min(1.15, scaleB + 0.12);
+          // 外法向用"多边形质心 → 顶点"近似，够用且无额外开销。
+          let ccx = 0, ccy = 0;
+          for (let i = 0; i < loop.n; i++) { ccx += xs[i * 2]; ccy += xs[i * 2 + 1]; }
+          ccx /= loop.n; ccy /= loop.n;
+          const OUT = 0.55;
+          // 只在"真的有边"的地方描轮廓。柔和渐隐（比如浅色圆盘向白纸过渡）
+          // 在原图里根本没有线，硬描一圈就是在画面里凭空加一个圆——回放里
+          // 一眼就看出不是人画的。判据可测量：沿轮廓取内外两点比色差，
+          // 平均差太小就跳过（这一笔交给色块本身的填充）。
+          {
+            let dsum = 0, dcnt = 0;
+            const step0 = Math.max(1, Math.floor(loop.n / 40));
+            for (let i = 0; i < loop.n; i += step0) {
+              const px0 = r.x0 + xs[i * 2], py0 = r.y0 + xs[i * 2 + 1];
+              const dx0 = px0 - (r.x0 + ccx), dy0 = py0 - (r.y0 + ccy);
+              const dl = Math.hypot(dx0, dy0) || 1;
+              const nx = dx0 / dl, ny = dy0 / dl;
+              const ix = Math.round(px0 - nx * 2.0), iy = Math.round(py0 - ny * 2.0);
+              const ox = Math.round(px0 + nx * 2.6), oy = Math.round(py0 + ny * 2.6);
+              if (ix < 1 || iy < 1 || ox < 1 || oy < 1 || ox >= W - 1 || oy >= H - 1) continue;
+              const pi = iy * W + ix, po = oy * W + ox;
+              const li = r.x0 + 0, lz = r.y0;
+              const bi = (iy - lz) * r.bw + (ix - li);
+              if (bi < 0 || bi >= r.fillMask.length || !r.fillMask[bi]) continue;
+              dsum += Math.abs(R[pi] - R[po]) + Math.abs(G[pi] - G[po]) + Math.abs(B[pi] - B[po]);
+              dcnt++;
+            }
+            if (dcnt >= 6 && dsum / dcnt < 30) return 0;
+          }
           let made = 0, a = 0, acc = 0;
           for (let cut = 0; cut < pieces && a < loop.n; cut++) {
             let b = a, run = 0;
@@ -9107,8 +9149,11 @@
               const sp = new Float64Array(n * 2), halfs = new Float64Array(n);
               for (let i = 0; i < n; i++) {
                 const j = Math.min(loop.n - 1, a + Math.round((b - a) * i / (n - 1)));
-                sp[i * 2] = r.x0 + xs[j * 2];
-                sp[i * 2 + 1] = r.y0 + xs[j * 2 + 1];
+                const px0 = r.x0 + xs[j * 2], py0 = r.y0 + xs[j * 2 + 1];
+                const dx0 = px0 - (r.x0 + ccx), dy0 = py0 - (r.y0 + ccy);
+                const dl = Math.hypot(dx0, dy0) || 1;
+                sp[i * 2] = px0 + dx0 / dl * OUT;
+                sp[i * 2 + 1] = py0 + dy0 / dl * OUT;
                 halfs[i] = hw * (0.84 + 0.16 * Math.sin(Math.PI * i / (n - 1))) *
                   (0.94 + 0.12 * srnd(r.id * 5.3 + j * 0.17 + i, 4.2));
               }
@@ -9258,7 +9303,11 @@
           // 只把真正成片的页面色场当成底板纹理。文字/描边旁的抗锯齿
           // 碎片面积小、所有权混杂，重画后会在主体尚未落笔时泄露整页
           // 鬼影；它们由后续对象事务和细节笔负责，不能提前参与底板。
-          const bgMinArea = Math.max(300, Math.round(N * 0.00045));
+          // 下限同时决定"背景被重刷多少遍"：旧值（N*0.00045 ≈ 470px）会让
+          // 一整片平涂背景被拆成两千多笔小补丁来回刷——人铺底色不会这样。
+          // 抬到 N*0.0035 后只有成片的明暗/渐变块参与，底色本身已由原子块
+          // 一次铺满，观感不变而笔数大幅下降。
+          const bgMinArea = Math.max(900, Math.round(N * 0.0012));
           const bgOwnMin = 0.85;
           let filteredGroups = 0;
           for (const g of groups) {
@@ -9281,37 +9330,160 @@
           bgGroups.sort((a, b) => b.area - a.area);
           // 逐组重铺必须裁在原色组 mask 内，颜色取该组真实局部色；顺序只在
           // 组间不重叠的像素上决定最后一笔，不会产生新的跨区域色块。
-          for (const g of bgGroups) {
-            const start = strokes.length;
-            // 原子底板已经把这页标成已覆盖；背景纹理组若不重置覆盖账，
-            // paintFull 的零增益判定会把它们全部删掉，最终只剩一个平色块。
-            // 这里只重置本组自己的像素和未覆盖计数，不碰其他组的所有权。
-            for (let yy = g.y0; yy <= g.y1; yy++) {
-              const row = yy * W;
-              for (let xx = g.x0; xx <= g.x1; xx++) {
-                const p = row + xx;
-                if (groupOf[p] === g.gid) paintN[p] = 0;
+          //
+          // 人铺底色是"几大笔推开"，不是把背景拆成上千个小补丁来回点。
+          // 旧实现按原色组逐组 paintFull，一整片平涂粉底因此要两千多笔。
+          // 这里改成按约 110px 的格子整块推进：每格一笔，颜色取格内原图
+          // 均值，笔身裁在页面底板掩膜内。渐变/暗角照样保留（每格自带局部
+          // 色），笔数从上千降到几十。
+          // 底色掩膜 = 所有"页面级"像素（含白纸本身）。只看当前区域的 paintMask
+          // 会漏掉同页的另一个底色区（例如浅色圆盘旁边的白纸），那些像素就
+          // 永远停在原子底板的单色上，成品里出现"圆盘颜色铺满整幅"或一圈白边。
+          const groundMask = new Uint8Array(N);
+          for (let p = 0; p < N; p++) {
+            const oid = plan.owner[p];
+            if (oid >= 0) {
+              const rr = plan.regions[oid];
+              if (rr && (rr.pageGround || rr === r)) groundMask[p] = 1;
+            }
+          }
+          for (let p = 0; p < N; p++) if ((r.paintMask || r.fillMask)[p]) groundMask[p] = 1;
+          // 底色是否"真的是平的"：看**格内**亮度标准差的中位数。平涂/渐变在
+          // 一格之内几乎没变化（中位数很低），扫描纹理/网点/暗角则很高。
+          // 用格内残差而不是全图方差，是因为全图方差只反映"跨页有渐变"——
+          // 而那恰好是格子铺色能忠实还原的部分。
+          const probeCell = Math.max(24, Math.round(Math.min(W, H) * 0.062));
+          let sd = 1e9, gn = 0;
+          {
+            const sds = [];
+            for (let gy = 0; gy < H; gy += probeCell) {
+              for (let gx = 0; gx < W; gx += probeCell) {
+                const gx1 = Math.min(W, gx + probeCell) - 1, gy1 = Math.min(H, gy + probeCell) - 1;
+                let a = 0, b = 0, c = 0;
+                for (let yy = gy; yy <= gy1; yy++) {
+                  const row = yy * W;
+                  for (let xx = gx; xx <= gx1; xx++) {
+                    const p = row + xx;
+                    if (!groundMask[p]) continue;
+                    const l = 0.299 * R[p] + 0.587 * G[p] + 0.114 * B[p];
+                    a += l; b += l * l; c++;
+                  }
+                }
+                if (c >= probeCell * probeCell * 0.5) {
+                  gn += c;
+                  sds.push(Math.sqrt(Math.max(0, b / c - (a / c) * (a / c))));
+                }
               }
             }
-            groupUncov[g.gid] = g.area;
-            paintFull(g, 1);
+            if (sds.length) { sds.sort((x, y) => x - y); sd = sds[sds.length >> 1]; }
+          }
+          const smoothGround = sd <= 12;
+          if (opts.debug) console.log('[compiler-ground] sd=' + (sd === 1e9 ? 'inf' : sd.toFixed(2)) +
+            ' px=' + gn + ' smooth=' + smoothGround + ' root=' + r.id);
+          if (!smoothGround) {
+            // 照片/扫描件：底色里有真实的扫描纹理与暗角，逐原色组重铺才能保住
+            // 这些层次，因此保留旧路径（组数本身受 bgMinArea 控制）。
+            for (const g of bgGroups) {
+              const start = strokes.length;
+              for (let yy = g.y0; yy <= g.y1; yy++) {
+                const row = yy * W;
+                for (let xx = g.x0; xx <= g.x1; xx++) {
+                  const p = row + xx;
+                  if (groupOf[p] === g.gid) paintN[p] = 0;
+                }
+              }
+              groupUncov[g.gid] = g.area;
+              paintFull(g, 1);
+              for (let i = start; i < strokes.length; i++) {
+                strokes[i].stage = 'compiler:page-bg';
+                strokes[i].travelK = 0.055;
+                strokes[i].fl = 1;
+                strokes[i].ms *= 0.10;
+              }
+              if (strokes.length > start) made += strokes.length - start;
+            }
+            if (opts.debug) console.log('[compiler-page] bgGroups=' + bgGroups.length +
+              ' filtered=' + filteredGroups + ' strokes=' + made + ' root=' + r.id);
+            return made;
+          }
+          const cellPx = Math.max(32, Math.round(Math.min(W, H) * 0.055));
+          // 纸面（近白）底色片单独按组一次铺平：格子把"白纸 + 浅色圆盘"
+          // 混在一格里会平均成中间色，成品就出现"底色铺满整幅画"和一圈白边。
+          for (const g of groups) {
+            if (g.area < N * 0.004) continue;
+            const ml = 0.299 * g.mean[0] + 0.587 * g.mean[1] + 0.114 * g.mean[2];
+            if (ml < 232) continue;
+            const gm = new Uint8Array(g.bw * g.bh);
+            let cnt = 0;
+            for (let yy = g.y0; yy <= g.y1; yy++) {
+              const row = yy * W + g.x0;
+              for (let xx = 0; xx < g.bw; xx++) {
+                if (groupOf[row + xx] === g.gid) { gm[(yy - g.y0) * g.bw + xx] = 1; cnt++; }
+              }
+            }
+            if (cnt < N * 0.003) continue;
+            const start = strokes.length;
+            emitBlockFill(g.x0, g.y0, g.bw, g.bh, gm, g.mean, 1, {
+              stage: 'compiler:page-bg',
+              ms: Math.round(150 + Math.min(260, Math.sqrt(cnt) * 0.22)),
+            });
             for (let i = start; i < strokes.length; i++) {
-              strokes[i].stage = 'compiler:page-bg';
               strokes[i].travelK = 0.055;
               strokes[i].fl = 1;
-              // 背景纹理是快速铺色，不是观众需要逐笔审视的主体事务。
-              // 压低这些小笔的时间权重，避免 10k 个底色抖动吞掉近半条时间线；
-              // 最终像素和笔数完全不变，只让主体对象更早进入画面。
-              strokes[i].ms *= 0.10;
             }
             if (strokes.length > start) made += strokes.length - start;
+          }
+          for (let gy = 0; gy < H; gy += cellPx) {
+            for (let gx = 0; gx < W; gx += cellPx) {
+              const gx1 = Math.min(W, gx + cellPx) - 1, gy1 = Math.min(H, gy + cellPx) - 1;
+              let sr = 0, sg = 0, sb = 0, cn = 0;
+              // 取色/裁切都用"底色区"（页面级像素 + 背景类色块 + 无主像素），
+              // 而不是页根 mask：同页的另一个底色碎片（浅色圆盘旁边的白纸）
+              // 如果不进格子，又没有任何对象事务认领它，成品就停在原子底板的
+              // 单色上——看起来像"主体色铺满了整幅画"。
+              for (let yy = gy; yy <= gy1; yy++) {
+                const row = yy * W;
+                for (let xx = gx; xx <= gx1; xx++) {
+                  const p = row + xx;
+                  if (!groundMask[p]) continue;
+                  sr += R[p]; sg += G[p]; sb += B[p]; cn++;
+                }
+              }
+              if (cn < cellPx * cellPx * 0.12) continue;
+              const col = [sr / cn, sg / cn, sb / cn];
+              const start = strokes.length;
+              // 一笔横跨整格（略微超出格子交给掩膜裁切），笔身约为格子一半高。
+              const half = cellPx * 0.5;
+              const cyC = (gy + gy1) * 0.5;
+              const sp = new Float64Array(6);
+              sp[0] = gx - half * 0.35; sp[1] = cyC;
+              sp[2] = (gx + gx1) * 0.5; sp[3] = cyC;
+              sp[4] = gx1 + half * 0.35; sp[5] = cyC;
+              const halfs = new Float64Array(3).fill(half * 0.62);
+              emitPlan(sp, halfs, col, ph, {
+                pen: 0, zoneMask: groundMask, noCover: 1, noZone: 1,
+                minInk: 1, forceKeep: 1, ms: Math.round(140 + cellPx * 1.6),
+              });
+              for (let i = start; i < strokes.length; i++) {
+                strokes[i].stage = 'compiler:page-bg';
+                strokes[i].travelK = 0.055;
+                strokes[i].fl = 1;
+              }
+              if (strokes.length > start) made += strokes.length - start;
+            }
           }
           if (opts.debug) console.log('[compiler-page] bgGroups=' + bgGroups.length +
             ' filtered=' + filteredGroups + ' strokes=' + made + ' root=' + r.id);
           return made;
         };
 
+        // 细墨线（≤3.2px 的胡须、外轮廓线、字边）：一笔到底。
+        // 人画一根胡须就是一笔；旧路径按 42px 切段、又把笔身按 thickness 抬高到
+        // 3.4~3.6px，于是 2px 的线被画成 40px 一段的粗短笔，来回好几道，
+        // 边缘犬牙交错。这里改成：不切段、笔身贴真实内切半径。
+        const INK_THIN_T = 3.2;
         const paintLineRegion = (r, ph, fine) => {
+          const thinInk = !fine && (r.thickness || 0) <= INK_THIN_T && r.mode === 'line';
           const paths = traceMaskPaths(r.mask, r.bw, r.bh, r.x0, r.y0);
           if (!paths.length) return fillRegion(r, r.fillMask, ph, 'compiler:line-fallback');
           const zmr = { m: r.fillMask, x0: r.x0, y0: r.y0, w: r.bw, h: r.bh };
@@ -9319,7 +9491,7 @@
           // 高精度描边：按真实色带的内切半径给笔身，并缩短取色段。每条短段
           // 的 localColor 只统计本笔在描边掩膜内盖到的像素，亮边/暗边不会被
           // 一个长段的中点色抹平。
-          const dtv = fine ? distanceTransform(r.mask, r.bw, r.bh) : null;
+          const dtv = (fine || thinInk) ? distanceTransform(r.mask, r.bw, r.bh) : null;
           const dtAt = (x, y) => {
             const xx = Math.round(x) - r.x0, yy = Math.round(y) - r.y0;
             if (xx < 0 || yy < 0 || xx >= r.bw || yy >= r.bh) return 0;
@@ -9327,14 +9499,19 @@
             return d >= 1e8 ? 0 : d;
           };
           let made = 0;
+          // 细墨线不切段（一整个骨架 = 一笔）；其它情况保持原来的取色粒度。
+          const segMax = thinInk ? Math.round(560 * scaleB) : (fine ? 42 : 240);
           for (const path of paths) {
-            for (const part of splitSkPath(path, fine ? 42 : 240)) {
+            for (const part of splitSkPath(path, segMax)) {
               if (part.n < 2) continue;
               const halfs = new Float64Array(part.n);
               for (let i = 0; i < part.n; i++) {
-                halfs[i] = fine
-                  ? clamp(dtAt(part.pts[i * 2], part.pts[i * 2 + 1]) / 3 * 1.35 + 1.25, 1.7, 7.5)
-                  : profFill(part.n, hw, r.id * 2.1 + part.len * 0.13 + runSeed * 0.31)[i];
+                halfs[i] = thinInk
+                  // dt 就是内切半径（像素）：+0.35 补半像素抗锯齿，别再乘系数加粗。
+                  ? clamp(dtAt(part.pts[i * 2], part.pts[i * 2 + 1]) * 1.06 + 0.35, 0.7, 2.8)
+                  : (fine
+                    ? clamp(dtAt(part.pts[i * 2], part.pts[i * 2 + 1]) / 3 * 1.35 + 1.25, 1.7, 7.5)
+                    : profFill(part.n, hw, r.id * 2.1 + part.len * 0.13 + runSeed * 0.31)[i]);
               }
               const mid = Math.max(0, part.n >> 1);
               const c = r.model.colorAt(Math.round(part.pts[mid * 2]), Math.round(part.pts[mid * 2 + 1]));
@@ -9540,6 +9717,64 @@
         // 会先看到半页蓝底，再逐段补黑框。纹理只能在这两者之后处理，且
         // 不允许再从基础底板 mask 中挖洞。
         const pageBaseStart = strokes.length;
+        // 人的第一笔是"把纸铺满"：不论区域分解把画面切成多少碎块，纸面必须
+        // 一次到位。此前底板只用页根区域的 mask，被分解判给别的对象的窄条
+        // （例如海报右缘那条 13px 竖带）在回放早期一直是画布白，直到它的
+        // 对象事务在 79% 处才补上，肉眼就是"边上有一条白线"。
+        // 这一笔不承担任何区域语义，只保证"整张纸有底色"；后面所有对象都盖
+        // 在它上面，因此成品像素与笔序的相对关系不变。
+        {
+          const root = pageFills[0] || null;
+          // 纸色取"没有任何区域认领的那片像素"里最多的颜色，而不是页根均值。
+          // 页根常常同时覆盖主体和边上的纸面，均值会落在主体色上——那样
+          // 第一笔就把本该是白纸的四周刷成了浅粉色。
+          let paperCol = null;
+          {
+            // 纸色判定：四个角都是接近纯白 → 这张画就是"白纸"（人也是这么看的，
+            // 先看一眼纸角）。否则说明画面是满幅底色（海报类），交给页根均值。
+            // 旧写法用页根均值，页根常常同时吃进主体和四周的纸面，均值落在主体
+            // 色上，第一笔就把本该是白纸的四周刷成了主体色。
+            const pad = Math.max(2, Math.round(Math.min(W, H) * 0.02));
+            const corners = [[0, 0], [W - pad, 0], [0, H - pad], [W - pad, H - pad]];
+            const means = [];
+            for (const [bx, by] of corners) {
+              let r2 = 0, g2 = 0, b2 = 0, n2 = 0;
+              for (let y = by; y < Math.min(H, by + pad); y++) {
+                for (let x = bx; x < Math.min(W, bx + pad); x++) {
+                  const p = y * W + x;
+                  r2 += R[p]; g2 += G[p]; b2 += B[p]; n2++;
+                }
+              }
+              if (n2) means.push([r2 / n2, g2 / n2, b2 / n2]);
+            }
+            if (means.length === 4) {
+              const lum = means.map((c) => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]);
+              const lo = Math.min(...lum), hi = Math.max(...lum);
+              if (lo >= 238 && hi - lo <= 14) {
+                paperCol = [
+                  means.reduce((a, c) => a + c[0], 0) / 4,
+                  means.reduce((a, c) => a + c[1], 0) / 4,
+                  means.reduce((a, c) => a + c[2], 0) / 4,
+                ];
+              }
+            }
+          }
+          const wash = paperCol || (bgFirstPlan && bgFirstPlan.washColor) ||
+            (root && (root.color || (root.model && root.model.mean))) || null;
+          if (wash) {
+            const whole = new Uint8Array(N).fill(1);
+            emitBlockFill(0, 0, W, H, whole, wash, 0, {
+              stage: 'compiler:page-wash',
+              zoneGid: undefined,
+              // 只把纸面颜色落下，不抢占覆盖率账：真正的"覆盖"仍由各对象
+              // 的精确笔负责，避免把尚未落笔的对象误记成已完成。
+              noZone: 1,
+              noCover: 1,
+              noCanvas: 1,
+              ms: Math.round(260 + Math.min(420, Math.sqrt(N) * 0.55)),
+            });
+          }
+        }
         let bgDone = 0;
         const bgTotal = Math.max(1, pageFills.length + frameFills.length +
           pageFills.filter((r) => {
@@ -9949,6 +10184,9 @@
         // 不再跑全图均值补丁，因此不会把蓝底重新刷成斑驳碎块。
         let repaired = 0, repairPx = 0;
         const repairStart = strokes.length;
+        const REPAIR_ERR = 20;
+        // 碎片面积下限：小于这个面积的误差块不值得单独起一笔。
+        const repairMinPx = Math.max(12, Math.round(Math.min(W, H) * 0.014));
         const maxRepairStrokes = Math.min(7000, Math.max(1000, Math.round(N * 0.0080)));
         const seen = new Uint8Array(N);
         const q = new Int32Array(N);
@@ -9966,7 +10204,11 @@
           return oid >= 0 && !!(plan.regions[oid] && plan.regions[oid].pageGround);
         };
         for (let p0 = 0; p0 < N && repaired < maxRepairStrokes; p0++) {
-          if (segPaper[p0] || seen[p0] || pageGroundOwner(p0) || errAt(p0) <= 12) continue;
+          // 只有"人眼能看出来"的偏差才值得补。旧阈值 12 会把大量 1~3px 的
+          // 抗锯齿碎点也当成漏画，逐块补一笔——回放里就是"零星小点"和
+          // "结尾还在补细碎笔"。取 20（仍在可见阈值 24 以内），并把
+          // 面积下限抬到 12px：碎点留在原笔的边缘里，比单独补一笔更像手画。
+          if (segPaper[p0] || seen[p0] || pageGroundOwner(p0) || errAt(p0) <= REPAIR_ERR) continue;
           const sr0 = R[p0], sg0 = G[p0], sb0 = B[p0];
           let head = 0, tail = 0;
           q[tail++] = p0; seen[p0] = 1;
@@ -9978,7 +10220,7 @@
             if (x < x0) x0 = x; if (x > x1) x1 = x;
             if (y < y0) y0 = y; if (y > y1) y1 = y;
             const visit = (z) => {
-              if (z < 0 || z >= N || seen[z] || segPaper[z] || pageGroundOwner(z) || errAt(z) <= 12) return;
+              if (z < 0 || z >= N || seen[z] || segPaper[z] || pageGroundOwner(z) || errAt(z) <= REPAIR_ERR) return;
               if (Math.max(Math.abs(R[z] - sr0), Math.abs(G[z] - sg0),
                 Math.abs(B[z] - sb0)) > 26) return;
               seen[z] = 1; q[tail++] = z;
@@ -9996,7 +10238,7 @@
             if (y > 0) visit(p - W);
             if (y + 1 < H) visit(p + W);
           }
-          if (pix.length < 3) continue;
+          if (pix.length < repairMinPx) continue;
           repairPx += pix.length;
           const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
           const m = new Uint8Array(bw * bh);
@@ -10031,10 +10273,28 @@
         {
           const seen = new Uint8Array(N);
           const q = new Int32Array(N);
-          const maxCoverStrokes = Math.min(2200, Math.max(900, Math.round(N * 0.0026)));
-          const coverMinPx = palette.length <= 7 ? Math.max(4, Math.min(12, Math.round(Math.min(W, H) * 0.01))) : 1;
+          const maxCoverStrokes = Math.min(1400, Math.max(700, Math.round(N * 0.0018)));
+          // 开场已经用一笔纸色洗过整张画布，所以"没盖到"的像素不会是白点，
+          // 只会比目标暗一点点。为了几个像素的接缝单独起一笔，回放里就是
+          // 抬笔去点一个看不见的小点——不像人。给个统一面积下限。
+          const coverMinPx = Math.max(8,
+            palette.length <= 7 ? Math.max(4, Math.min(12, Math.round(Math.min(W, H) * 0.01))) : 1);
+          // "纸色"掩膜原本被整片跳过，于是色块与纸面交界处常留 1px 未涂的
+          // 接缝：成品里就是一条细白圈（例如浅色圆盘的外缘）。这里允许补
+          // 紧贴已画像素的那一层纸色，但只补一层——纸面内部仍然不碰。
+          const seam = new Uint8Array(N);
+          for (let y = 0; y < H; y++) {
+            const row = y * W;
+            for (let x = 0; x < W; x++) {
+              const p = row + x;
+              if (!segPaper[p] || covered[p]) continue;
+              if ((x > 0 && covered[p - 1]) || (x + 1 < W && covered[p + 1]) ||
+                (y > 0 && covered[p - W]) || (y + 1 < H && covered[p + W])) seam[p] = 1;
+            }
+          }
           for (let p0 = 0; p0 < N && coverStrokes < maxCoverStrokes; p0++) {
-            if (segPaper[p0] || covered[p0] || seen[p0]) continue;
+            if (covered[p0] || seen[p0]) continue;
+            if (segPaper[p0] && !seam[p0]) continue;
             let head = 0, tail = 0;
             q[tail++] = p0; seen[p0] = 1;
             const pix = [];
@@ -10045,7 +10305,8 @@
               if (x < x0) x0 = x; if (x > x1) x1 = x;
               if (y < y0) y0 = y; if (y > y1) y1 = y;
               const visit = (z) => {
-                if (z < 0 || z >= N || seen[z] || covered[z] || segPaper[z]) return;
+                if (z < 0 || z >= N || seen[z] || covered[z]) return;
+                if (segPaper[z] && !seam[z]) return;
                 seen[z] = 1; q[tail++] = z;
               };
               if (x > 0) visit(p - 1);
@@ -10204,7 +10465,11 @@
           return made;
         };
         const detail = groups.filter((g) => {
-          if ((groupFilter && !groupFilter.has(g.gid)) || bgSet[g.gid] || g.area < 4) return false;
+          // 面积下限：细线结构天然窄，按 4px 起；色块要够大才值得单独落笔。
+          // 4px 的碎色块单独画一笔，等于在人画面里点一个小点——这正是用户
+          // 说的"零星小点"。它们本来就被父色和抗锯齿边覆盖，跳过更自然。
+          if ((groupFilter && !groupFilter.has(g.gid)) || bgSet[g.gid]) return false;
+          if (g.area < (g.lineLike ? 4 : 12)) return false;
           if (!g.lineLike && g.area > Math.max(900, N * 0.0015)) return false;
           // 组级收口不是重画全图：只挑当前画布仍有可见误差的组。小字碎组
           // 通常几乎整组都错，会完整走微型掩膜；已经画准的组直接跳过，
@@ -10223,7 +10488,11 @@
               if (e > maxE) maxE = e;
             }
           }
-          return n > 0 && (bad >= Math.max(1, Math.ceil(n * 0.04)) || maxE >= 48);
+          // 判定"这个组还值得再动一笔"：要么有一小片（≥3px 且 ≥6%）明显偏差，
+          // 要么整组面积够大且峰值偏差极高。旧条件只要 1 个像素 maxE≥48 就重画，
+          // 于是边界上的抗锯齿碎组被反复描成小点。
+          return n > 0 && (bad >= Math.max(3, Math.ceil(n * 0.06)) ||
+            (maxE >= 48 && n >= 24));
         }).sort((a, b) =>
           (Math.floor(a.y0 / Math.max(24, Math.min(84, H * 0.065))) -
            Math.floor(b.y0 / Math.max(24, Math.min(84, H * 0.065)))) ||
@@ -10251,8 +10520,118 @@
           }
           console.log('[compiler:detail-cats] ' + JSON.stringify(Object.fromEntries(Object.entries(cat).sort((a, b) => b[1] - a[1]))));
         }
-        let done = 0;
+        // ---- 细墨线：一条线一笔 ----
+        // 2~3px 的墨线（胡须、外轮廓线、字边）如果按"色组碎片"各自落块，一根胡须
+        // 会被拆成几十笔小方块/短线，边缘犬牙交错、粗细不匀；真人是一笔从头拉到尾。
+        // 这里把本事务内所有细线组并成一张掩膜，沿骨架整体走线：宽度取真实内切
+        // 半径（不再用 1.3 倍放大），一条线一笔，颜色取笔下的原图均值。
+        const THIN_T = 2.4;
+        const thinGroups = [];
+        const thickDetail = [];
         for (const g of detail) {
+          if (g.lineLike && !g.grad && (g.thick || 0) <= THIN_T && g.area >= 4) thinGroups.push(g);
+          else thickDetail.push(g);
+        }
+        const INK_MIN_LEN = 120;
+        const paintThinInk = (gs) => {
+          if (!gs.length) return gs;
+          let x0 = W, y0 = H, x1 = -1, y1 = -1;
+          const gids = new Uint8Array(G_);
+          for (const g of gs) {
+            gids[g.gid] = 1;
+            if (g.x0 < x0) x0 = g.x0; if (g.x1 > x1) x1 = g.x1;
+            if (g.y0 < y0) y0 = g.y0; if (g.y1 > y1) y1 = g.y1;
+          }
+          if (x1 < 0) return gs;
+          const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+          const m = new Uint8Array(bw * bh);
+          let any = 0;
+          for (let y = y0; y <= y1; y++) {
+            const row = y * W;
+            for (let x = x0; x <= x1; x++) {
+              const gid = groupOf[row + x];
+              if (gid >= 0 && gids[gid]) { m[(y - y0) * bw + (x - x0)] = 1; any++; }
+            }
+          }
+          if (!any) return [];
+          const paths = traceMaskPaths(m, bw, bh, x0, y0);
+          if (!paths.length) return [];
+          // 只把"真正的长线"当一笔画：胡须、轮廓线、长笔画。字缘、碎点这类
+          // 短骨架上笔反而更毛糙，它们仍然走原来的块面/短笔通路。
+          const keepPaths = paths.filter((p) => p.len >= INK_MIN_LEN);
+          if (!keepPaths.length) return gs;
+          const dtv = distanceTransform(m, bw, bh);
+          const dtAt = (ax, ay) => {
+            const xx = Math.round(ax) - x0, yy = Math.round(ay) - y0;
+            if (xx < 0 || yy < 0 || xx >= bw || yy >= bh) return 0;
+            const d = dtv[yy * bw + xx];
+            return d >= 1e8 ? 0 : d;
+          };
+          // 这一笔实际会盖住的像素（骨架两侧各 2~3px），用来判断哪些组真被它解决了
+          const hit = new Uint8Array(bw * bh);
+          for (const path of keepPaths) {
+            const n = path.n;
+            for (let i = 0; i < n; i++) {
+              const px = Math.round(path.pts[i * 2]) - x0, py = Math.round(path.pts[i * 2 + 1]) - y0;
+              for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+                const xx = px + dx, yy = py + dy;
+                if (xx >= 0 && yy >= 0 && xx < bw && yy < bh) hit[yy * bw + xx] = 1;
+              }
+            }
+          }
+          // 组级分流：被长线吃掉的组交给这一笔；剩下的组仍走原通路
+          const leftover = [];
+          for (const g of gs) {
+            let tot = 0, got = 0;
+            for (let yy = g.y0; yy <= g.y1; yy++) {
+              const row = yy * W;
+              for (let xx = g.x0; xx <= g.x1; xx++) {
+                if (groupOf[row + xx] !== g.gid) continue;
+                tot++;
+                if (hit[(yy - y0) * bw + (xx - x0)]) got++;
+              }
+            }
+            if (!tot || got / tot < 0.62) leftover.push(g);
+            else {
+              // 已经被这一整笔吃掉：不要再把覆盖账清零，否则后面的
+              // 细节收口会认为这些像素"还没画"，用小块再描一遍——
+              // 这正是"同一处反复描好几道"的来源。
+              groupUncov[g.gid] = 0;
+            }
+          }
+          // zoneMask 按"全画布像素下标"取址
+          const zone = new Uint8Array(N);
+          for (let y = y0; y <= y1; y++) {
+            const row = y * W;
+            for (let x = x0; x <= x1; x++) if (m[(y - y0) * bw + (x - x0)]) zone[row + x] = 1;
+          }
+          const maxLen = Math.round(520 * scaleB);
+          const s0 = strokes.length;
+          for (const path of keepPaths) {
+            for (const ch of splitSkPath(path, maxLen)) {
+              if (ch.n < 2 || (ch.len || 0) < INK_MIN_LEN * 0.6) continue;
+              const halfs = new Float64Array(ch.n);
+              let sr = 0, sg = 0, sb = 0, cn = 0;
+              for (let i = 0; i < ch.n; i++) {
+                const px = ch.pts[i * 2], py = ch.pts[i * 2 + 1];
+                // 笔身贴着真实线宽走：dt 是内切半径，再加半像素抗锯齿余量。
+                halfs[i] = clamp(dtAt(px, py) + 0.35, 0.7, 2.1);
+                const ii = Math.round(py) * W + Math.round(px);
+                if (ii >= 0 && ii < N) { sr += R[ii]; sg += G[ii]; sb += B[ii]; cn++; }
+              }
+              const col = tone(cn ? [sr / cn, sg / cn, sb / cn] : [0, 0, 0]);
+              emitPlan(ch.pts, halfs, col, 3, {
+                pen: 1, zoneMask: zone, zoneGroups: gids, zoneTol: 255,
+                forceKeep: 1, ms: Math.round(150 + ch.len * 2.0),
+              });
+            }
+          }
+          for (let si = s0; si < strokes.length; si++) strokes[si].stage = 'compiler:ink-line';
+          return leftover;
+        };
+        const inkLeft = paintThinInk(thinGroups) || thinGroups;
+        let done = 0;
+        for (const g of thickDetail.concat(inkLeft)) {
           // 编译器的大区域已经写过一层，但小字/细线往往只是“被某个父色盖住”，
           // 覆盖账会被误判为已完成，随后 paintLine/paintBlob 的新笔又因
           // zoneCov 没有增长而被当作零增益删除。组级收口本来就是要用原像素
