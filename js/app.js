@@ -623,11 +623,15 @@ function paintStroke(i, u, dest) {
   if (st.blk && u <= 0) return false;
   const rgb = 'rgb(' + st.color[0] + ',' + st.color[1] + ',' + st.color[2] + ')';
   const rect = { x: cl.x, y: cl.y, w: cl.w, h: cl.h };
-  // tmp 画布只留格子大小（不够就长，绝不缩）：每笔的 clearRect/fill/stroke/掩膜合成
-  // 从"全画布 × 4 次"降到"格子 × 4 次"——拖进度条、快进一口气重画几千笔时不再卡住整页
-  if (tmpC.width < rect.w || tmpC.height < rect.h) {
-    tmpC.width = Math.max(tmpC.width, rect.w);
-    tmpC.height = Math.max(tmpC.height, rect.h);
+  // tmp 画布跟着"当前格子"走：不够就长、大太多就缩（留 2× 余量，避免每笔都重建）。
+  // 关键点：掩膜合成 destination-in 和两次 drawImage 的成本是按 *tmp 画布面积* 算的，
+  // 不是按笔形面积算的。以前只长不缩，一笔全画布格子（铺纸底色 / 整页色块）会把 tmp
+  // 顶到整幅画布大小，之后每一笔（哪怕只有 30×20）都要做一次 100 万像素的合成——
+  // 实测单笔 7.3ms，播放时每帧 8~9 笔就直接掉到 7fps（严重的卡顿）。跟着格子缩放后单笔 0.15ms。
+  if (tmpC.width < rect.w || tmpC.height < rect.h ||
+      tmpC.width > rect.w * 2 || tmpC.height > rect.h * 2) {
+    tmpC.width = Math.max(1, rect.w);
+    tmpC.height = Math.max(1, rect.h);
   }
   tmp.setTransform(1, 0, 0, 1, 0, 0);               // 清格子必须在恒等变换下
   tmp.clearRect(0, 0, rect.w, rect.h);
@@ -666,11 +670,12 @@ function paintStroke(i, u, dest) {
   }
   tmp.restore();
   tmp.setTransform(1, 0, 0, 1, 0, 0);               // 掩膜合成也必须在恒等变换下，否则整块错位
-  // 掩膜裁形：ImageData 放到共用的格子画布上，再以 destination-in 画过来
+  // 掩膜裁形：ImageData 放到共用的格子画布上，再以 destination-in 画过来。
+  // maskC 必须与 tmpC 同尺寸——destination-in 是整块运算，源比目标小会把目标其余部分擦成透明。
   if (!maskC) { maskC = document.createElement('canvas'); mk = maskC.getContext('2d'); }
-  if (maskC.width < rect.w || maskC.height < rect.h) {
-    maskC.width = Math.max(maskC.width, rect.w);
-    maskC.height = Math.max(maskC.height, rect.h);
+  if (maskC.width !== tmpC.width || maskC.height !== tmpC.height) {
+    maskC.width = tmpC.width;
+    maskC.height = tmpC.height;
   }
   mk.putImageData(clipImageFor(st.c), 0, 0);
   tmp.globalCompositeOperation = 'destination-in';
@@ -848,14 +853,28 @@ function tick() {
   schedule();
 }
 
-// 页面在后台时 rAF 不触发：退回定时器，保证"离开标签页也会继续画"
+// 页面在后台时 rAF 不触发：退回定时器，保证"离开标签页也会继续画"。
+// 同一时刻只允许一个待执行的 tick：以前 schedule() 与看门狗会各自排队一条 rAF 链，
+// 每排一次就多一条链，帧越慢链越多、链越多帧越慢（实测每帧跑 6.8 次 tick，
+// 也就是同一帧里把当前这笔重画了 6 遍）——这是播放卡顿的第二个来源。
+let tickQueued = false, tickQueuedAt = 0, tickGen = 0;
 function schedule() {
-  if (document.hidden) setTimeout(tick, 100);
-  else requestAnimationFrame(tick);
+  const now = performance.now();
+  // 250ms 内已经排过就不再排；超时说明那次 rAF 丢了（切到后台 / 被节流），重新排一条。
+  if (tickQueued && now - tickQueuedAt < 250) return;
+  tickQueued = true; tickQueuedAt = now;
+  const gen = ++tickGen;
+  const run = function () {
+    if (gen !== tickGen) return;           // 已被更新的排程取代：这条作废，避免同一帧跑两次 tick
+    tickQueued = false;
+    tick();
+  };
+  if (document.hidden) setTimeout(run, 100);
+  else requestAnimationFrame(run);
 }
-// 看门狗：窗口未聚焦时 rAF 可能被节流甚至暂停，这里保证动画继续推进
+// 看门狗：窗口未聚焦时 rAF 可能被节流甚至暂停，这里保证动画继续推进（同样只排队一次）
 setInterval(function () {
-  if (performance.now() - lastTickAt > 50) tick();
+  if (performance.now() - lastTickAt > 50) schedule();
 }, 50);
 
 function restoreKey(k, ctx) {
@@ -1618,9 +1637,10 @@ function exportedPlayer() {
     if (st.blk && u <= 0) return false;
     const rgb = 'rgb(' + st.color[0] + ',' + st.color[1] + ',' + st.color[2] + ')';
     const rect = { x: cl.x, y: cl.y, w: cl.w, h: cl.h };
-    if (tmpC.width < rect.w || tmpC.height < rect.h) {   // tmp 只留格子大小，按需长大
-      tmpC.width = Math.max(tmpC.width, rect.w);
-      tmpC.height = Math.max(tmpC.height, rect.h);
+    if (tmpC.width < rect.w || tmpC.height < rect.h ||
+        tmpC.width > rect.w * 2 || tmpC.height > rect.h * 2) {   // tmp 跟着格子缩放（详见主播放器的注释）
+      tmpC.width = Math.max(1, rect.w);
+      tmpC.height = Math.max(1, rect.h);
     }
     tmp.setTransform(1, 0, 0, 1, 0, 0);                 // 清格子必须在恒等变换下
     tmp.clearRect(0, 0, rect.w, rect.h);
@@ -1657,9 +1677,9 @@ function exportedPlayer() {
     tmp.restore();
     tmp.setTransform(1, 0, 0, 1, 0, 0);                 // 掩膜合成必须在恒等变换下
     if (!maskC) { maskC = document.createElement('canvas'); mk = maskC.getContext('2d'); }
-    if (maskC.width < rect.w || maskC.height < rect.h) {
-      maskC.width = Math.max(maskC.width, rect.w);
-      maskC.height = Math.max(maskC.height, rect.h);
+    if (maskC.width !== tmpC.width || maskC.height !== tmpC.height) {   // 与 tmpC 同尺寸，否则 dest-in 会擦掉其余部分
+      maskC.width = tmpC.width;
+      maskC.height = tmpC.height;
     }
     mk.putImageData(clipImageFor(st.c), 0, 0);
     tmp.globalCompositeOperation = 'destination-in';
@@ -1855,12 +1875,18 @@ function exportedPlayer() {
     hud();
     schedule();
   }
+  let tickQueued = false, tickQueuedAt = 0, tickGen = 0;
   function schedule() {
-    if (document.hidden) setTimeout(tick, 100);
-    else requestAnimationFrame(tick);
+    const now = performance.now();
+    if (tickQueued && now - tickQueuedAt < 250) return;   // 只排一次（详见主播放器的注释）
+    tickQueued = true; tickQueuedAt = now;
+    const gen = ++tickGen;
+    const run = function () { if (gen !== tickGen) return; tickQueued = false; tick(); };
+    if (document.hidden) setTimeout(run, 100);
+    else requestAnimationFrame(run);
   }
   setInterval(function () {
-    if (performance.now() - lastTickAt > 50) tick();
+    if (performance.now() - lastTickAt > 50) schedule();
   }, 50);
   function fitView() {
     const maxW = Math.min(1100, window.innerWidth - 24), maxH = window.innerHeight - 130;
