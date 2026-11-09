@@ -13,6 +13,17 @@
   // 当前还原程度（1 省笔 … 5 极致）：编译器各阶段读它决定"补多细"，
   // 档位差异才落在细节密度上，而不是只改几个补笔预算。
   let COMPILER_FID = 3;
+  // 还原程度的"色彩分辨率"档位表（见 run() 里的 COMPILER_VIEW）。
+  // 语义（2026-11-09 定）：档位 = 处理细节/过渡色的细致程度，而不是"多补多少笔"。
+  //   ① 省笔：把图像量化成很少的色块（渐变 → 深/中/浅 三级）
+  //   ③ 标准：基准档，逐像素结果不变
+  //   ⑤ 极致：区域色彩模型按近 1:1 的分辨率还原过渡，结构与标准档一致
+  let COMPILER_VIEW = null;
+  // 量化档（①②）的落笔颜色收敛函数：把任何"算出来的颜色"收到色板上。
+  // 区域均值会跨过两种色板色（父块铺底、细线取色），不收敛就会在成片纯色里
+  // 冒出一块块只差几个色阶的补丁。
+  let SNAP_OUT = null;
+  const snapOut = (c) => (SNAP_OUT && c ? SNAP_OUT(c) : c);
   let CAPFIX = true;              // ribbonProf 两端圆头扫正前方（老代码扫侧后方 = 端头缺半个圆 + 啃笔身）
   let PROF_FLAT_SAMPLE = true;    // 细长层取色用"平头"变宽笔形（与 ribbon 的 noCap 一致）
 
@@ -3303,7 +3314,10 @@
     // ---- 色板：颜色直方图 + 加权最远点。平涂图用众数色，浅橘/奶白不会被均值混成灰泥 ----
     // 铅笔的色板只用来分区，最终都转灰：色块少一点反而更像"概括过的形"；
     // 分得太碎时，暗部会碎成一堆小斑，猫的整块剪影就散了。
-    const K = (style === 'marker' ? [8, 9, 10, 12, 14] : style === 'oil' ? [8, 10, 12, 14, 16] : [6, 7, 8, 9, 11])[fid - 1];
+    // 色数随还原程度走：① 只有几个色（渐变被并成深/中/浅几块），⑤ 接近原图色阶。
+    // ③ 仍是 10 色，基准档的逐像素结果不变。
+    const Kbase = (style === 'marker' ? 10 : style === 'oil' ? 12 : 8) * (COMPILER_VIEW ? COMPILER_VIEW.k : 1);
+    const K = Math.max(3, Math.min(64, Math.round(Kbase)));
     const stS = Math.max(2, Math.round(Math.sqrt(N / 70000)));
     const BINS = 16, binN = BINS * BINS * BINS;
     const bCnt = new Int32Array(binN), bR = new Float64Array(binN), bG = new Float64Array(binN), bB = new Float64Array(binN);
@@ -3368,6 +3382,23 @@
       }
     }
     palette.sort((a, b) => luma(a) - luma(b));
+    // 低档位把图像量化到色板时，色板里"肉眼分不出的两个近似色"必须并掉：
+    // 一片大面积渐变（浅粉圆盘）被量化成两个只差 3~5 个色阶的粉，
+    // 分界线在成品里就是一块块看得见的圆角色斑——省笔档要的是"几块纯色"，
+    // 不是"打了补丁的一整块"。只在量化档合并，标准档及以上不动。
+    if (COMPILER_VIEW && COMPILER_VIEW.snap) {
+      for (let i = 0; i < palette.length; i++) {
+        for (let j = i + 1; j < palette.length;) {
+          if (colorDist2(palette[i], palette[j]) < 760) {
+            palette[i] = [
+              Math.round((palette[i][0] + palette[j][0]) / 2),
+              Math.round((palette[i][1] + palette[j][1]) / 2),
+              Math.round((palette[i][2] + palette[j][2]) / 2)];
+            palette.splice(j, 1);
+          } else j++;
+        }
+      }
+    }
     const nearestPalette = (c) => {
       let best = palette[0], bd = Infinity;
       for (let i = 0; i < palette.length; i++) {
@@ -3384,6 +3415,19 @@
       const c = nearestPalette(want);
       return (luma(c) < luma(base) - 2 && colorDist2(c, base) < 5200) ? c : base;
     };
+
+    // ---- 低档位：把图像本身量化到色板（"省笔 = 概括成几块纯色"）----
+    // 量化发生在最前面：分区、取色、误差判定都跟着同一张量化图走，成品与目标一致，
+    // 不会出现"目标还是渐变、笔却是色块"的色差。③ 档及更高档不动原图。
+    // 落笔颜色也一并收敛到色板（跨色板色的区域均值会变成"补丁色"）。
+    SNAP_OUT = (COMPILER_VIEW && COMPILER_VIEW.snap) ? nearestPalette : null;
+    if (COMPILER_VIEW && COMPILER_VIEW.snap) {
+      for (let p = 0; p < N; p++) {
+        const c = nearestPalette([R[p], G[p], B[p]]);
+        R[p] = c[0]; G[p] = c[1]; B[p] = c[2];
+      }
+      for (let p = 0; p < N; p++) L[p] = (0.299 * R[p] + 0.587 * G[p] + 0.114 * B[p] + 0.5) | 0;
+    }
 
     // ---- 量化 + 去噪 + 连通区 ----
     prog(0.14, '概括：' + palette.length + ' 色 · 分块…');
@@ -5387,8 +5431,9 @@
         else ang += (srnd(g.gid * 3.1, 5.2) - 0.5) * (flatArt ? 0.08 : 0.20);
         return isFinite(ang) ? ang : 0;
       };
-      // 档位只改笔触粗细/密度：分色区和取色由图像决定，成品精度不靠档位。
-      const fidScale = [1.25, 1.12, 1, 0.9, 0.8][fid - 1];
+      // 档位改笔触粗细/密度（① 更宽的带 ⇒ 更少的笔；⑤ 更窄的带 ⇒ 过渡更细），
+      // 分色区和取色由（可能需要量化的）图像决定，成品精度不靠档位。
+      const fidScale = [1.55, 1.24, 1, 0.88, 0.76][fid - 1];
       const bandHalf = (g) => {
         let bw = Math.sqrt(g.area) * (flatArt ? 0.98 : 0.86);
         bw = Math.min(bw, Math.max(7, g.thick * 2.7));
@@ -5427,7 +5472,8 @@
           sp[i * 2 + 1] = g.cy + u * sa + vv * ca;
         }
         const halfs = profFill(nP, halfW * 1.03, g.gid * 2.7 + v * 0.13 + runSeed * 0.37);
-        const softBg = flatArt && g.soft ? 1 : 0;
+        // ① 省笔档不要网点：色块就是色块，网点会把"几步纯色"又糊成灰。
+        const softBg = (flatArt && g.soft && !(COMPILER_VIEW && COMPILER_VIEW.snap)) ? 1 : 0;
         if (softBg) {
           // 背景是比 8 位色阶还细的渐变：一笔取本笔实际盖住像素的浮点均值，
           // 再拆成两级互补网点落笔。单笔纯色会在色阶处留下马赫色带，
@@ -9383,7 +9429,9 @@
           const smoothGround = sd <= 12;
           if (opts.debug) console.log('[compiler-ground] sd=' + (sd === 1e9 ? 'inf' : sd.toFixed(2)) +
             ' px=' + gn + ' smooth=' + smoothGround + ' root=' + r.id);
-          if (!smoothGround) {
+          // 量化档（①②）：底色区本身就是几个纯色区域，逐组铺平比逐格采样更准——
+          // 格子会把色块边界切成 90px 的圆角方斑，逐组铺平则是沿原图等色线的干净边。
+          if (!smoothGround || (COMPILER_VIEW && COMPILER_VIEW.snap)) {
             // 照片/扫描件：底色里有真实的扫描纹理与暗角，逐原色组重铺才能保住
             // 这些层次，因此保留旧路径（组数本身受 bgMinArea 控制）。
             for (const g of bgGroups) {
@@ -9411,7 +9459,7 @@
           }
           // 底色格边长随还原程度缩放：省笔档格子更大（几笔铺完），
           // 极致档更小（色场起伏跟得更紧）。基准 = 5.5% 短边。
-          const cellScale = [1.45, 1.20, 1, 0.84, 0.70][COMPILER_FID - 1];
+          const cellScale = COMPILER_VIEW ? COMPILER_VIEW.cell : 1;
           const cellPx = Math.max(24, Math.round(Math.min(W, H) * 0.055 * cellScale));
           // 纸面（近白）底色片单独按组一次铺平：格子把"白纸 + 浅色圆盘"
           // 混在一格里会平均成中间色，成品就出现"底色铺满整幅画"和一圈白边。
@@ -9439,44 +9487,75 @@
             }
             if (strokes.length > start) made += strokes.length - start;
           }
-          for (let gy = 0; gy < H; gy += cellPx) {
-            for (let gx = 0; gx < W; gx += cellPx) {
-              const gx1 = Math.min(W, gx + cellPx) - 1, gy1 = Math.min(H, gy + cellPx) - 1;
-              let sr = 0, sg = 0, sb = 0, cn = 0;
-              // 取色/裁切都用"底色区"（页面级像素 + 背景类色块 + 无主像素），
-              // 而不是页根 mask：同页的另一个底色碎片（浅色圆盘旁边的白纸）
-              // 如果不进格子，又没有任何对象事务认领它，成品就停在原子底板的
-              // 单色上——看起来像"主体色铺满了整幅画"。
-              for (let yy = gy; yy <= gy1; yy++) {
-                const row = yy * W;
-                for (let xx = gx; xx <= gx1; xx++) {
-                  const p = row + xx;
-                  if (!groundMask[p]) continue;
-                  sr += R[p]; sg += G[p]; sb += B[p]; cn++;
-                }
+          // 省笔/简洁档：图像已被量化成有限几个色，同一行里颜色相同的相邻格
+          // 要并成"一条长横扫"。逐格落笔会把大色块画成一堆带圆角的方斑
+          // （回放里就是"补丁/云斑"），并成长条之后色块边界才是干净的一条边。
+          const washMerge = !!(COMPILER_VIEW && COMPILER_VIEW.row);
+          const washSnap = (COMPILER_VIEW && COMPILER_VIEW.snap) ? ((c) => nearestPalette(c)) : ((c) => c);
+          const cellColor = (gx, gy, gx1, gy1) => {
+            let sr = 0, sg = 0, sb = 0, cn = 0;
+            // 取色/裁切都用"底色区"（页面级像素 + 背景类色块 + 无主像素），
+            // 而不是页根 mask：同页的另一个底色碎片（浅色圆盘旁边的白纸）
+            // 如果不进格子，又没有任何对象事务认领它，成品就停在原子底板的
+            // 单色上——看起来像"主体色铺满了整幅画"。
+            for (let yy = gy; yy <= gy1; yy++) {
+              const row = yy * W;
+              for (let xx = gx; xx <= gx1; xx++) {
+                const p = row + xx;
+                if (!groundMask[p]) continue;
+                sr += R[p]; sg += G[p]; sb += B[p]; cn++;
               }
-              if (cn < cellPx * cellPx * 0.12) continue;
-              const col = [sr / cn, sg / cn, sb / cn];
-              const start = strokes.length;
-              // 一笔横跨整格（略微超出格子交给掩膜裁切），笔身约为格子一半高。
-              const half = cellPx * 0.5;
-              const cyC = (gy + gy1) * 0.5;
-              const sp = new Float64Array(6);
-              sp[0] = gx - half * 0.35; sp[1] = cyC;
-              sp[2] = (gx + gx1) * 0.5; sp[3] = cyC;
-              sp[4] = gx1 + half * 0.35; sp[5] = cyC;
-              const halfs = new Float64Array(3).fill(half * 0.62);
-              emitPlan(sp, halfs, col, ph, {
-                pen: 0, zoneMask: groundMask, noCover: 1, noZone: 1,
-                minInk: 1, forceKeep: 1, ms: Math.round(140 + cellPx * 1.6),
-              });
-              for (let i = start; i < strokes.length; i++) {
-                strokes[i].stage = 'compiler:page-bg';
-                strokes[i].travelK = 0.055;
-                strokes[i].fl = 1;
-              }
-              if (strokes.length > start) made += strokes.length - start;
             }
+            if (cn < cellPx * cellPx * 0.12) return null;
+            return washSnap([sr / cn, sg / cn, sb / cn]);
+          };
+          const emitSpan = (x0, x1, cyC, col, half) => {
+            const start = strokes.length;
+            // 一笔横跨整格（略微超出格子交给掩膜裁切），笔身约为格子一半高。
+            const sp = new Float64Array(6);
+            sp[0] = x0 - half * 0.35; sp[1] = cyC;
+            sp[2] = (x0 + x1) * 0.5; sp[3] = cyC;
+            sp[4] = x1 + half * 0.35; sp[5] = cyC;
+            const halfs = new Float64Array(3).fill(half * 0.62);
+            emitPlan(sp, halfs, col, ph, {
+              pen: 0, zoneMask: groundMask, noCover: 1, noZone: 1,
+              minInk: 1, forceKeep: 1, ms: Math.round(140 + (x1 - x0) * 1.6),
+            });
+            for (let i = start; i < strokes.length; i++) {
+              strokes[i].stage = 'compiler:page-bg';
+              strokes[i].travelK = 0.055;
+              strokes[i].fl = 1;
+            }
+            if (strokes.length > start) made += strokes.length - start;
+          };
+          for (let gy = 0; gy < H; gy += cellPx) {
+            const gy1 = Math.min(H, gy + cellPx) - 1;
+            const cyC = (gy + gy1) * 0.5;
+            if (!washMerge) {
+              for (let gx = 0; gx < W; gx += cellPx) {
+                const gx1 = Math.min(W, gx + cellPx) - 1;
+                const col = cellColor(gx, gy, gx1, gy1);
+                if (col) emitSpan(gx, gx1, cyC, col, cellPx * 0.5);
+              }
+              continue;
+            }
+            // 量化档：整行按颜色分成长条；半宽给到 0.9 格，行与行之间微微重叠，
+            // 否则格子的上下留缝会露成一条条浅色横线（比色块本身更显眼）。
+            let runX0 = -1, runX1 = -1, runCol = null;
+            const flush = () => {
+              if (runCol) emitSpan(runX0, runX1, cyC, runCol, cellPx * 0.9);
+              runCol = null;
+            };
+            for (let gx = 0; gx < W; gx += cellPx) {
+              const gx1 = Math.min(W, gx + cellPx) - 1;
+              const col = cellColor(gx, gy, gx1, gy1);
+              if (!col) { flush(); continue; }
+              if (runCol && Math.abs(col[0] - runCol[0]) + Math.abs(col[1] - runCol[1]) +
+                  Math.abs(col[2] - runCol[2]) < 12) { runX1 = gx1; continue; }
+              flush();
+              runX0 = gx; runX1 = gx1; runCol = col;
+            }
+            flush();
           }
           if (opts.debug) console.log('[compiler-page] bgGroups=' + bgGroups.length +
             ' filtered=' + filteredGroups + ' strokes=' + made + ' root=' + r.id);
@@ -11218,7 +11297,7 @@
             x0: cp.x0, y0: cp.y0, x1: cp.x1, y1: cp.y1, bw, bh,
             cx: (cp.x0 + cp.x1) * 0.5, cy: (cp.y0 + cp.y1) * 0.5,
             insideX: nearX, insideY: nearY,
-            color: [Math.round(sr / cp.count), Math.round(sg / cp.count), Math.round(sb / cp.count)],
+            color: snapOut([Math.round(sr / cp.count), Math.round(sg / cp.count), Math.round(sb / cp.count)]),
             gids, mask, fillMask, outer, loops, mode, hullMask: solidFill, hullArea,
             fillRatio, ownRatio, thickness, canvasFrame, frameLike,
             angle: bw >= bh ? 0 : Math.PI * 0.5,
@@ -11360,6 +11439,10 @@
           ];
         };
         const fitColorModel = (mask, bw, bh, x0, y0, count) => {
+          // 色彩模型的分辨率随还原程度走：① 只允许"一整块纯色"，
+          // ⑤ 才用 64×64 色场 / 9 级色带把过渡还原到接近 1:1。
+          const CV = COMPILER_VIEW || { gridBig: 32, gridMid: 10, gridSmall: 4, gpen: 0.9,
+            kMaxBig: 4, kMaxMid: 3, kMaxSmall: 2, pen: 0.85, plane: 1 };
           let sr = 0, sg = 0, sb = 0, mnR = 255, mnG = 255, mnB = 255, mxR = 0, mxG = 0, mxB = 0;
           let sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
           const syr = [0, 0, 0], syg = [0, 0, 0], syb = [0, 0, 0];
@@ -11411,9 +11494,9 @@
               const bi = Math.max(0, Math.min(m.colors.length - 1, Math.floor(t * m.colors.length)));
               c = m.colors[bi];
             } else c = m.mean;
-            return [Math.round(clampC(c[0], m.lo[0], m.hi[0])),
+            return snapOut([Math.round(clampC(c[0], m.lo[0], m.hi[0])),
               Math.round(clampC(c[1], m.lo[1], m.hi[1])),
-              Math.round(clampC(c[2], m.lo[2], m.hi[2]))];
+              Math.round(clampC(c[2], m.lo[2], m.hi[2]))]);
           };
           const errOf = (m) => {
             let err = 0, n = 0;
@@ -11435,7 +11518,8 @@
           if (count >= 18) {
             const A = [count, sx, sy, sx, sxx, sxy, sy, sxy, syy];
             const cr = solve3(A, syr), cg = solve3(A, syg), cb = solve3(A, syb);
-            if (cr && cg && cb) {
+            // ① 省笔档不拟合线性渐变：一整块纯色才叫"色块"。
+            if (CV.plane && cr && cg && cb) {
               const pm = { kind: 'plane', coef: [cr, cg, cb], mean, lo, hi, err: 0 };
               pm.err = errOf(pm);
               if (pm.err + 1.25 < best.err) best = pm;
@@ -11443,8 +11527,8 @@
             // 大色块用低分辨率双线性色场：它等价于“现场从原图采样一张
             // 4×4 调色网”，能跟随扫描件的暗角、纸张渐变和低频明暗，却不把
             // 同色背景重新切成独立补丁。所有格子由闭合 mask 自己采样。
-            if (count >= 300) {
-              const gx = count >= 100000 ? 32 : (count >= 1200 ? 10 : 4);
+            if (count >= 300 && CV.gridBig > 1) {
+              const gx = count >= 100000 ? CV.gridBig : (count >= 1200 ? CV.gridMid : CV.gridSmall);
               const gy = gx;
               const ga = new Float64Array(gx * gy * 4);
               for (let yy = 0; yy < bh; yy++) {
@@ -11494,12 +11578,12 @@
               }
               const gm = { kind: 'grid', gx, gy, grid, mean, lo, hi, err: 0 };
               gm.err = errOf(gm);
-              if (gm.err + 0.9 < best.err) best = gm;
+              if (gm.err + CV.gpen < best.err) best = gm;
             }
             const vx = sxx / count - (sx / count) * (sx / count);
             const vy = syy / count - (sy / count) * (sy / count);
             const axis = vx >= vy ? 0 : 1;
-            const Kmax = count >= 900 ? 4 : (count >= 260 ? 3 : 2);
+            const Kmax = count >= 900 ? CV.kMaxBig : (count >= 260 ? CV.kMaxMid : CV.kMaxSmall);
             for (let K = 2; K <= Kmax; K++) {
               const acc = Array.from({ length: K }, () => [0, 0, 0, 0]);
               for (let yy = 0; yy < bh; yy++) {
@@ -11515,7 +11599,7 @@
               const colors = acc.map((a) => a[3] ? [a[0] / a[3], a[1] / a[3], a[2] / a[3]] : mean);
               const bm = { kind: 'bands', axis, colors, mean, lo, hi, err: 0 };
               bm.err = errOf(bm);
-              if (bm.err + 0.85 * (K - 1) < best.err) best = bm;
+              if (bm.err + CV.pen * (K - 1) < best.err) best = bm;
             }
           }
           best.mean = mean;
@@ -11611,7 +11695,7 @@
             x0: cp.x0, y0: cp.y0, x1: cp.x1, y1: cp.y1, bw, bh,
             cx: (cp.x0 + cp.x1) * 0.5, cy: (cp.y0 + cp.y1) * 0.5,
             insideX: nearX, insideY: nearY,
-            color: model.mean, model, mask, fillMask,
+            color: snapOut(model.mean), model, mask, fillMask,
             paintMask: mode === 'solid' ? solidFill : mask, outer, loops,
             hullMask: solidFill, hullArea,
             mode, rawFill, ownRatio, thickness, canvasFrame, frameLike,
@@ -11721,14 +11805,14 @@
           for (const ch of close) addMask(ch.x0, ch.y0, ch.mask, ch.bw, ch.bh);
           if (modelPx > 0) {
             r.model = fitColorModel(modelMask, r.bw, r.bh, r.x0, r.y0, modelPx);
-            r.color = r.model.mean;
+            r.color = snapOut(r.model.mean);
             r.modelPx = modelPx;
           }
           // 低对比碎块仍保留自己的真实几何，避免吸收后露出纸白；
           // 但它们统一使用父层重新拟合的连续色场，成品的颜色接缝因此消失。
           for (const ch of close) {
             ch.model = r.model;
-            ch.color = r.model.mean;
+            ch.color = snapOut(r.model.mean);
             ch.modelFrom = r.id;
             normalized.add(ch);
           }
@@ -11757,7 +11841,7 @@
             const pageFragment = anchor.fillArea >= N * 0.12 && r.fillArea >= N * 0.0015 && edgeBand;
             if (!nested && !pageFragment) continue;
             r.model = anchor.model;
-            r.color = anchor.model.mean;
+            r.color = snapOut(anchor.model.mean);
             r.modelFrom = anchor.id;
             normalized.add(r);
           }
@@ -14036,27 +14120,53 @@
     fid = Math.max(1, Math.min(5, Math.round(+fid) || 3));
     opts.fidelity = fid;
     COMPILER_FID = fid;
-    // 档位差异全部落在“补笔要补多细”上：轮数、阈值、补漏切分、笔数上限；
-    // 主笔触的取色/分区逻辑不动，所以低档只是少补细节，不会把画面画歪。
+    SNAP_OUT = null;
+    // ---- 还原程度 = “处理细节 / 过渡色”的细致程度（2026-11-09 重定义）----
+    // 旧版把 4/5 档做成“补漏切得更碎、补丁更多”，结果插画上 ⑤ 档反而更乱更慢
+    // （实测 s1：①③ 逐像素差 3.1%、⑤ 3.9%），档与档之间除了笔数也没别的差别。
+    // 新版只动两件事：
+    //   1) 色彩分辨率：区域色板色数 k、区域色彩模型（色带/色场）分辨率、底色格边长；
+    //   2) 补笔只沿用基准档的结构参数，4/5 档仅多补 1~2 轮残差。
+    // 于是 ① 把渐变并成 3~5 个色块，⑤ 把过渡还原到接近 1:1，中间各档只差色彩分辨率。
+    COMPILER_VIEW = [
+      // k：区域色板色数倍率基准；snap：是否把图像量化到色板（色块感）；
+      // kMax*：色带模型上限；grid*：色场格子数；pen/gpen：模型验收惩罚（越小越细）；
+      // cell：底色（纸面/渐变底）格子边长系数
+      { k: 0.75, snap: 1, row: 1, kMaxBig: 1, kMaxMid: 1, kMaxSmall: 1, cell: 1.00,
+        gridBig: 0, gridMid: 0, gridSmall: 0, gpen: 1.40, pen: 1.60, plane: 0 },
+      { k: 0.88, snap: 1, row: 1, kMaxBig: 4, kMaxMid: 4, kMaxSmall: 3, cell: 1.00,
+        gridBig: 0, gridMid: 0, gridSmall: 0, gpen: 1.10, pen: 1.15, plane: 1 },
+      { k: 1.00, snap: 0, kMaxBig: 4, kMaxMid: 3, kMaxSmall: 2, cell: 1.00,
+        gridBig: 32, gridMid: 10, gridSmall: 4, gpen: 0.90, pen: 0.85, plane: 1 },
+      // 4/5 档的色板色数保持和标准档一致：把区域切得更碎反而会让"父块铺底"
+      // 顺序错位（猫身体下缘那道浅色横带就是色板加到 22 色后切出来的）。
+      // 这两档的细腻度全部交给色彩模型（色场/色带）和底色格子。
+      { k: 1.00, snap: 0, kMaxBig: 6, kMaxMid: 4, kMaxSmall: 3, cell: 0.80,
+        gridBig: 48, gridMid: 14, gridSmall: 5, gpen: 0.65, pen: 0.55, plane: 1 },
+      { k: 1.00, snap: 0, kMaxBig: 9, kMaxMid: 5, kMaxSmall: 3, cell: 0.62,
+        gridBig: 64, gridMid: 20, gridSmall: 6, gpen: 0.45, pen: 0.35, plane: 1 },
+    ][fid - 1];
+    // 诊断用：调用方可以覆盖档位表里的单项（实验脚本用，正常路径不传）。
+    if (rawOpts.viewOverride) COMPILER_VIEW = Object.assign({}, COMPILER_VIEW, rawOpts.viewOverride);
+    // 档位差异落在"色彩分辨率 + 补多细"上，不再改补漏切分/收边门槛：
+    // 主笔触的取色/分区逻辑不动，所以低档只是更概括，不会把画面画歪。
     // 只覆盖仍是默认值的项：调用方显式传的参数优先（外部项目可以自己微调）。
     const setDefault = (vals) => {
       for (const k in vals) if (opts[k] === CFG[k]) opts[k] = vals[k];
     };
     if (fid === 1) {
-      setDefault({ residual: [34, 28, 23, 19], holeT: 46, resMin: 1.5,
-                   holeSplit: 26, resTail: 0, resTailMax: 2 });
+      setDefault({ residual: [34, 28, 23, 19], holeT: 40, resMin: 1.35,
+                   holeSplit: 22, resTail: 0, resTailMax: 2 });
     } else if (fid === 2) {
-      setDefault({ residual: [32, 26, 21, 17], holeT: 36, resMin: 1.15,
+      setDefault({ residual: [32, 26, 21, 17], holeT: 33, resMin: 1.15,
                    holeSplit: 14, resTail: 0 });
     } else if (fid === 4) {
-      setDefault({ residual: [30, 24, 18, 14, 11, 9, 7, 5.5, 4.5], holeT: 20,
-                   resMin: 0.75, resHalfA: 0.85, resHalfB: 0.55,
-                   holeSplit: 6, edgeT: 7 });
+      // 精细：结构参数与标准档一致，只多补一轮更细的残差。
+      setDefault({ residual: [30, 24, 18, 14, 11, 9, 7, 5.5], resMin: 0.9 });
     } else if (fid === 5) {
-      setDefault({ residual: [30, 24, 18, 14, 11, 9, 7, 5.5, 4.5, 3.8], holeT: 17,
-                   resMin: 0.6, resHalfA: 0.8, resHalfB: 0.5,
-                   holeSplit: 4, edgeT: 6, resTail: 3, resTailMax: 4,
-                   exactRepair: 1, exactRepairShift: 1, exactRepairMax: 400000 });
+      // 极致：再多补两轮。旧版这里把补漏阈值压到 17、切分压到 4、外加全图精修，
+      // 插画上会把一整块色区切成几段不同色（猫身体上那道浅色横带就是这么来的）。
+      setDefault({ residual: [30, 24, 18, 14, 11, 9, 7, 5.5, 4.5], resMin: 0.8 });
     }
     const capScale = fid === 1 ? 0.5 : (fid === 2 ? 0.7 : (fid === 4 ? 1.3 : (fid === 5 ? 1.8 : 1)));
     // cover mode：档位不再是"补笔轮数"，而是颜色容差 + 笔数预算。
