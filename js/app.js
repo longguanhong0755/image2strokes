@@ -156,7 +156,7 @@ function startExtract(imgCanvas) {
     seed: runSeed,
   };
   if (!worker) {
-    worker = new Worker('js/worker.js?v=71');
+    worker = new Worker('js/worker.js?v=72');
     worker.onmessage = onWorker;
     worker.onerror = (e) => { setExtracting(false); note('出错：' + e.message, 'err'); };
   }
