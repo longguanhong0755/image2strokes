@@ -5652,6 +5652,163 @@ CTX 的构造在 pipeline.js 的 exactCtx()。
       await yieldUI();
     };
 
+    // ---- 色块编译器执行器 ----
+    // 每个块一次原子填充（emitBlockFill）：形状由裁剪掩膜决定，颜色取块均值。
+    // 块与块互不重叠，所以最终画布和落块顺序无关；顺序只服务回放观感。
+    //   事务 1：贴边背景块（pageBase）——先把整幅底色铺出来；
+    //   之后：前景块按空间聚成“对象”，按视觉行（先上后下、行内先左后右）
+    //         逐个提交。一个对象 = 一次从起笔到抬笔，和画人的发力单元一致。
+    const paintBlockPlan = async () => {
+      const plan = blockPlan;
+      const tB = Date.now();
+      const txRecords = [];
+      const blocks = plan.blocks, K = blocks.length, lab = plan.labels;
+      // ---- 底板：贴边块（外圈/纸边）先并成一条 pageBase 事务 ----
+      const bBorder = new Uint8Array(K);
+      for (let x = 0; x < W; x++) {
+        bBorder[lab[x]] = 1;
+        bBorder[lab[(H - 1) * W + x]] = 1;
+      }
+      for (let y = 0; y < H; y++) {
+        bBorder[lab[y * W]] = 1;
+        bBorder[lab[y * W + W - 1]] = 1;
+      }
+      const bgIds = [];
+      for (let i = 0; i < K; i++) if (bBorder[i]) bgIds.push(i);
+      // ---- 对象聚类：前景块按空间网格分桶（桶数约为事务预算的 2.5 倍），
+      // 同桶合并；仍超预算时，反复合并空间上最近的两个对象，保持区域连贯。
+      const maxTx = Math.max(8, Math.min(140, Math.round(N / 6000)));
+      const gCell = Math.max(8, Math.sqrt(N / (maxTx * 2.5)));
+      const gCols = Math.max(1, Math.ceil(W / gCell));
+      const clMap = new Map();
+      for (let i = 0; i < K; i++) {
+        if (bBorder[i]) continue;
+        const b = blocks[i];
+        const gx = Math.min(gCols - 1, Math.floor((b.x0 + b.bw * 0.5) / gCell));
+        const gy = Math.floor((b.y0 + b.bh * 0.5) / gCell);
+        const key = gy * gCols + gx;
+        let c = clMap.get(key);
+        if (!c) {
+          c = { ids: [], x0: b.x0, y0: b.y0, x1: b.x0 + b.bw - 1, y1: b.y0 + b.bh - 1 };
+          clMap.set(key, c);
+        }
+        c.ids.push(i);
+        if (b.x0 < c.x0) c.x0 = b.x0;
+        if (b.y0 < c.y0) c.y0 = b.y0;
+        if (b.x0 + b.bw - 1 > c.x1) c.x1 = b.x0 + b.bw - 1;
+        if (b.y0 + b.bh - 1 > c.y1) c.y1 = b.y0 + b.bh - 1;
+      }
+      const clusters = [...clMap.values()];
+      while (clusters.length > maxTx) {
+        let bi = 0, bj = 1, best = Infinity;
+        for (let i = 0; i < clusters.length; i++) {
+          const a = clusters[i];
+          for (let j = i + 1; j < clusters.length; j++) {
+            const b = clusters[j];
+            const gx = Math.max(0, Math.max(a.x0, b.x0) - Math.min(a.x1, b.x1));
+            const gy = Math.max(0, Math.max(a.y0, b.y0) - Math.min(a.y1, b.y1));
+            const g = gx * gx + gy * gy;
+            if (g < best) { best = g; bi = i; bj = j; }
+          }
+        }
+        const a = clusters[bi], b = clusters[bj];
+        for (const id of b.ids) a.ids.push(id);
+        if (b.x0 < a.x0) a.x0 = b.x0;
+        if (b.y0 < a.y0) a.y0 = b.y0;
+        if (b.x1 > a.x1) a.x1 = b.x1;
+        if (b.y1 > a.y1) a.y1 = b.y1;
+        clusters.splice(bj, 1);
+      }
+      // 视觉行：先上后下、行内先左后右（和真人扫幅顺序一致）。
+      const bandH = Math.max(24, Math.min(84, H * 0.065));
+      clusters.sort((a, b) => {
+        const ba = Math.floor(a.y0 / bandH), bb = Math.floor(b.y0 / bandH);
+        if (ba !== bb) return ba - bb;
+        return (a.x0 - b.x0) || (a.y0 - b.y0);
+      });
+      // ---- 提交器：从 from 到当前笔尾记为一条事务 ----
+      const commit = (from, txId, kind, box) => {
+        if (CTX.strokes.length <= from) return;
+        const txSeq = txRecords.length;
+        for (let i = from; i < CTX.strokes.length; i++) {
+          const st = CTX.strokes[i];
+          st.tx = txId;
+          st.txKind = kind;
+          st.txSeq = txSeq;
+          st.step = 'fill';
+        }
+        txRecords.push({
+          id: txId, seq: txSeq, kind,
+          strokeStart: from, strokeEnd: CTX.strokes.length,
+          x0: box.x0, y0: box.y0, x1: box.x1, y1: box.y1,
+        });
+      };
+      const emitOne = (b) => {
+        const ph = b.depth <= 0 ? 0 : (b.depth === 1 ? 1 : (b.depth <= 3 ? 2 : 3));
+        // 块越大，落块越“慢”（像大刷子铺一块）；小块快速点上去。
+        const si = emitBlockFill(b.x0, b.y0, b.bw, b.bh, b.mask, b.color, ph, {
+          stage: 'compiler:block',
+          ms: Math.round(60 + Math.min(300, Math.sqrt(b.area) * 2.2)),
+        });
+        if (si >= 0) {
+          CTX.strokes[si].stage = 'compiler:block';
+          CTX.strokes[si].travelK = b.depth <= 0 ? 0.10 : 0.04;
+        }
+      };
+      let done = 0, yieldedAt = 0;
+      const tick = async () => {
+        done++;
+        if (done - yieldedAt >= 48) {
+          yieldedAt = done;
+          prog(0.22 + 0.66 * (done / Math.max(1, K)), '落块：一块一块铺满…');
+          await yieldUI();
+        }
+      };
+      // 1) 底板：贴边块并成一条 pageBase 事务，整幅先有底色。
+      if (bgIds.length) {
+        bgIds.sort((a, b) => blocks[b].area - blocks[a].area);
+        let bx0 = W, by0 = H, bx1 = -1, by1 = -1;
+        for (const id of bgIds) {
+          const b = blocks[id];
+          if (b.x0 < bx0) bx0 = b.x0;
+          if (b.y0 < by0) by0 = b.y0;
+          if (b.x0 + b.bw - 1 > bx1) bx1 = b.x0 + b.bw - 1;
+          if (b.y0 + b.bh - 1 > by1) by1 = b.y0 + b.bh - 1;
+        }
+        // 贴边块铺满整幅时，事务盒就用整幅（回放要看到“整张纸先落底”）。
+        if (bx0 <= 0 && by0 <= 0 && bx1 >= W - 1 && by1 >= H - 1) {
+          bx0 = 0; by0 = 0; bx1 = W - 1; by1 = H - 1;
+        }
+        const from = CTX.strokes.length;
+        for (const id of bgIds) { emitOne(blocks[id]); await tick(); }
+        commit(from, 'block:pageBase', 'pageBase', { x0: bx0, y0: by0, x1: bx1, y1: by1 });
+      }
+      // 2) 主体：一个相邻块簇 = 一个对象事务。
+      for (let ci = 0; ci < clusters.length; ci++) {
+        const c = clusters[ci];
+        const from = CTX.strokes.length;
+        c.ids.sort((a, b) => (blocks[a].depth - blocks[b].depth) || (blocks[b].area - blocks[a].area));
+        for (const id of c.ids) { emitOne(blocks[id]); await tick(); }
+        commit(from, 'block:obj' + ci, 'object', { x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1 });
+      }
+      // 色块是整幅划分：每个像素都落了色。覆盖率按“已画”记，
+      // 免得把“块色与源图有偏差”误报成漏画。
+      for (let p = 0; p < N; p++) if (paintN[p]) covered[p] = 1;
+      CTX.groupUncov.fill(0);
+      for (let p = 0; p < N; p++) {
+        if (!paintN[p] && !segPaper[p] && groupOf[p] >= 0) CTX.groupUncov[groupOf[p]]++;
+      }
+      pfClosedRegions = K;
+      pfObjects = clusters.length;
+      pfRing = false;
+      painterBgFill = 'compiler';
+      plan.transactions = txRecords;
+      if (opts.debug) console.log('[blocks] done blocks=' + K + ' tx=' + txRecords.length +
+        ' objects=' + clusters.length + ' bgBlocks=' + bgIds.length +
+        ' strokes=' + CTX.strokes.length + ' ms=' + (Date.now() - tB));
+      await yieldUI();
+    };
+
     // ---- compiler 的组级最后一层 ----
     // 区域合并适合建立父子层级和大块闭合面，但会把小字、点、胡须、细框
     // 合成过宽或过碎的候选。这里不重新铺底，只回到原图色组：细线沿骨架、
@@ -6591,12 +6748,39 @@ CTX 的构造在 pipeline.js 的 exactCtx()。
       return { regions, order, roots, groundFragments, sourceComps: lc.comps };
     })();
 
-    // ---- 无训练绘画编译器 ----
+    // ---- 色块编译器（新路径）----
+    // 一块 = 一个连通区域 + 一种颜色 + 一次原子落块；没有“笔”的概念。
+    // 全分辨率边缘感知分割 → 碎块吸收 → 受控合并 → 拓扑深度出序。
+    // 它不依赖"平涂/照片"的预判：照片照样按色块铺，判断交给算法本身。
+    // 旧的区域编译器保留为 A/B 对照：opts.compilerLegacy。
+    let blockPlan = null;
+    if (compilerFlow && root.BLOCKS && !opts.compilerLegacy) {
+      try {
+        blockPlan = root.BLOCKS.build(R, G, B, W, H, {
+          fidelity: COMPILER_FID, seed: runSeed,
+          blockK: opts.blockK, blockMergeD: opts.blockMergeD, blockNoiseD: opts.blockNoiseD,
+          blockMse: opts.blockMse, blockBudget: opts.blockBudget, blockBlur: opts.blockBlur,
+          blockSnap: opts.blockSnap,
+        });
+      } catch (err) {
+        blockPlan = null;
+        if (opts.debug) console.log('[blocks] 规划失败，回退旧编译器：' + (err && err.message));
+      }
+      if (blockPlan && opts.debug) {
+        const s = blockPlan.stats;
+        console.log('[blocks] fidelity=' + COMPILER_FID + ' blocks=' + s.blocks +
+          ' meanErr=' + s.meanErr.toFixed(2) + ' p95=' + s.p95 + ' bad%=' + s.badPct.toFixed(1) +
+          ' k=' + s.tau + ' mergeD=' + s.mergeD + ' mse=' + s.mseT + ' budget=' + s.budget +
+          ' ms=' + s.ms);
+      }
+    }
+
+    // ---- 无训练绘画编译器（旧路径，保留做 A/B）----
     // 与 closed 路径并列：同样把父区域整块填满，但区域颜色不再是一个均值。
     // 每个对象会拟合“常数 / 平面渐变 / 2~4 条色带”中最简单且误差最低的色场；
     // 细线条单独成为候选，全部区域画完后再压到最上层。
     compilerPlan = (() => {
-      if (!(compilerFlow && flatArt)) return null;
+      if (blockPlan || !(compilerFlow && flatArt)) return null;
       const lc = compsOfLabels(labels, W, H);
       const minArea = Math.max(9, Math.round(N * 0.000009));
       const contourMin = Math.max(28, Math.round(N * 0.000028));
@@ -7212,7 +7396,8 @@ CTX 的构造在 pipeline.js 的 exactCtx()。
       }
       return { regions, order, roots, fills, lines, owner, normalized, fitColorModel, sourceComps: lc.comps, objectBgGids };
     })();
-    compilerActive = !!(compilerFlow && flatArt && compilerPlan && compilerPlan.order.length);
+    compilerActive = !!(compilerFlow &&
+      ((blockPlan && blockPlan.order.length) || (flatArt && compilerPlan && compilerPlan.order.length)));
     closedActive = !!(painterFlow && flatArt && closedPlan && closedPlan.order.length);
     // 闭合路径自己负责完整作画；旧背景规划只作为 artist/回退路径的参考，
     // 不能再用 bgFirstPlan 的有无来决定 painter 是否启动。
@@ -7582,11 +7767,16 @@ CTX 的构造在 pipeline.js 的 exactCtx()。
     // ---- 画家·过程版分支：平涂优先走闭合区域画家；照片保持原路径 ----
     const washIdx = [];
     if (compilerActive) {
-      // 对象事务、无归属细节、独立尾线、残差修正和补缝都已在
-      // paintCompilerPlan() 内部按事务顺序完成；这里不能再重跑一遍细节，
-      // 否则会在所有已提交事务之后追加一串无 tx 元数据的覆盖笔。
-      await paintCompilerPlan();
-      if (opts.compilerObjectPass) await paintHumanFlow(true, compilerPlan.objectBgGids);
+      // 对象事务、无归属细节、独立尾线、残差修正和补缝都已在执行器内部
+      // 按事务顺序完成；这里不能再重跑一遍细节，否则会在所有已提交事务
+      // 之后追加一串无 tx 元数据的覆盖笔。
+      if (blockPlan) {
+        // 色块路径：整幅划分，没有“父区域 / 细节笔”的第二层。
+        await paintBlockPlan();
+      } else {
+        await paintCompilerPlan();
+        if (opts.compilerObjectPass) await paintHumanFlow(true, compilerPlan.objectBgGids);
+      }
     } else if (closedActive) {
       await paintClosedPlan();
     } else if (painterActive) {
@@ -7813,7 +8003,8 @@ CTX 的构造在 pipeline.js 的 exactCtx()。
       const bySeq = new Map();
       const byId = new Map();
       const planTxBySeq = new Map();
-      const planTxs = (compilerPlan && compilerPlan.transactions) || [];
+      const planTxs = (blockPlan && blockPlan.transactions) ||
+        (compilerPlan && compilerPlan.transactions) || [];
       for (const rec of planTxs) planTxBySeq.set(rec.seq, rec);
       let fallbackSeq = 0;
       for (let i = 0; i < CTX.strokes.length; i++) {
@@ -7871,6 +8062,7 @@ CTX 的构造在 pipeline.js 的 exactCtx()。
       globalThis.__ISP_DUMP_GROUPOF = groupOf;
       globalThis.__ISP_DUMP_CLOSED = closedPlan;
       globalThis.__ISP_DUMP_COMPILER = compilerPlan;
+      globalThis.__ISP_DUMP_BLOCKS = blockPlan;
       globalThis.__ISP_DUMP_LABELS = labels;
       globalThis.__ISP_DUMP_COVERED = covered;
       globalThis.__ISP_DUMP_PAPER = paper;

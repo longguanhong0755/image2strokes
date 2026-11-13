@@ -33,7 +33,7 @@ let finishHoldTimer = 0;
 let finishHoldStarted = 0;
 let airPath = null;             // 抬笔移动的弧线（画在纸面上的淡虚线）
 const lastEnd = [0, 0];         // 上一笔收笔的位置（抬笔弧线的起点）
-let algo = 'artist';            // 当前算法：artist 画家模式 / layer 分层宽笔 / pyramid 逐级细化
+let algo = 'compiler';          // 当前算法：compiler 区域编译器（默认）/ artist 画家模式 / layer 分层宽笔 / pyramid 逐级细化
 let srcCanvas = null;           // 最近一次选图的画布：切换算法时原地重提炼
 let PHASES = ['铺底色', '铺色', '收形', '点睛', '落款'];
 
@@ -140,7 +140,7 @@ function startExtract(imgCanvas) {
   setExtracting(true);
   $('bar').style.width = '0%';
   const fid = parseInt($('fidelity').value, 10) || 3;
-  setAlgoPhases($('algo') ? $('algo').value : 'artist');
+  setAlgoPhases($('algo') ? $('algo').value : 'compiler');
   // 过程可以每张不同，但每次的种子要能复现：?seed=123 可重跑同一段笔序。
   const seedQ = new URLSearchParams(location.search).get('seed');
   RUN_SEED = (seedQ !== null && seedQ !== '' && isFinite(+seedQ))
@@ -156,7 +156,7 @@ function startExtract(imgCanvas) {
     seed: runSeed,
   };
   if (!worker) {
-    worker = new Worker('js/worker.js?v=72');
+    worker = new Worker('js/worker.js?v=76');
     worker.onmessage = onWorker;
     worker.onerror = (e) => { setExtracting(false); note('出错：' + e.message, 'err'); };
   }
@@ -2384,20 +2384,20 @@ function bindUI() {
   $('fidelity').addEventListener('input', syncFid);
   syncFid();
   // 算法选择：URL ?algo= 优先，其次记住上次选择。
-  // 不记住的话每次刷新都会弹回默认的 artist（准确复刻），看起来就像"改动没生效/还是旧版"。
+  // 不记住的话每次刷新都会弹回默认的区域编译器，看起来就像"改动没生效/还是旧版"。
   const ALGO_KEY = 'isp.algo';
   const ALGO_OK = { artist: 1, painter: 1, compiler: 1, layer: 1, pyramid: 1 };
   const saveAlgo = (v) => { try { localStorage.setItem(ALGO_KEY, v); } catch (e) {} };
   const pickAlgo = () => {
     const sel = $('algo');
-    if (!sel) return 'artist';
+    if (!sel) return 'compiler';
     const q = (new URLSearchParams(location.search).get('algo') || '').trim();
     if (ALGO_OK[q]) { sel.value = q; return q; }   // 本次访问临时固定，不覆盖已记住的选择
     let v = '';
     if (!v) {
       try { const s = localStorage.getItem(ALGO_KEY) || ''; if (ALGO_OK[s]) v = s; } catch (e) {}
     }
-    if (!v) v = sel.value || 'artist';
+    if (!v) v = sel.value || 'compiler';
     sel.value = v;
     saveAlgo(v);
     return v;

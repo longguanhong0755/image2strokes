@@ -47,6 +47,8 @@
     if (!root.ISP_PIPELINE_COVER) await import('./pipeline/cover.js');
     if (!root.ISP_PIPELINE_PYRAMID) await import('./pipeline/pyramid.js');
     if (!root.ISP_PIPELINE_EXACT) await import('./pipeline/artist-exact.js');
+    // 色块编译器（compiler 新路径）是独立模块，worker 里由 engine.js 预加载。
+    if (!root.BLOCKS) await import('./pipeline/blocks.js');
     COVER = root.ISP_PIPELINE_COVER;
     PYRAMID = root.ISP_PIPELINE_PYRAMID;
     EXACT = root.ISP_PIPELINE_EXACT;

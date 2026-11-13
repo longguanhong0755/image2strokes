@@ -23,8 +23,9 @@ const ENGINE_BASE = new URL(self.ISP_ENGINE_BASE || './', self.location.href).hr
 importScripts(new URL('pipeline/util.js?v=1', ENGINE_BASE).href);
 importScripts(new URL('pipeline/pyramid.js?v=1', ENGINE_BASE).href);
 importScripts(new URL('pipeline/cover.js?v=1', ENGINE_BASE).href);
-importScripts(new URL('pipeline/artist-exact.js?v=1', ENGINE_BASE).href);
-importScripts(new URL('pipeline.js?v=71', ENGINE_BASE).href);
+importScripts(new URL('pipeline/artist-exact.js?v=3', ENGINE_BASE).href);
+importScripts(new URL('pipeline/blocks.js?v=2', ENGINE_BASE).href);
+importScripts(new URL('pipeline.js?v=74', ENGINE_BASE).href);
 
 if (!self.ISP_PIPELINE || typeof self.ISP_PIPELINE.run !== 'function') {
   throw new Error('image2strokes engine.js: pipeline.js 没有导出 run()');
