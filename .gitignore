@@ -17,6 +17,7 @@ dev/stg/
 # 本地 agent 的计划/缓存
 .zcode/
 
-# 含明文 GitHub PAT 的内部交接文档，绝不进公开仓库
+# 含明文 GitHub PAT / 本机路径 / 端口等敏感数据的内部交接文档，绝不进公开仓库
 HANDOFF.md
 HANDOFF_FULL.md
+HANDOFF_*.md
